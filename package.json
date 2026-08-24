@@ -1,0 +1,9 @@
+{
+  "name": "bskit-dealbook-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BSKIT DealBook용 백엔드 — 3AI 비교 분석 + 직장인구(SGIS) 프록시",
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}

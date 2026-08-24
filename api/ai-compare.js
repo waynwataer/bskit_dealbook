@@ -1,0 +1,247 @@
+// api/ai-compare.js
+// BSKIT DealBook의 "BSKIT AI Analyst"가 호출하는 백엔드.
+// API 키(OPENAI_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY)는 절대 대시보드
+// HTML에 넣지 않고, 이 서버(Vercel 프로젝트)의 환경변수로만 보관합니다.
+//
+// 대시보드 CONFIG.AI_COMPARE_ENDPOINT 에는 이 함수가 배포된 주소를 넣습니다.
+// 예) https://bskit-backend.vercel.app/api/ai-compare
+
+module.exports = async function handler(req, res) {
+  // 티스토리(외부 도메인)에서 오는 요청을 허용
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
+  if (req.method !== 'POST') { res.status(405).json({ error: 'POST 요청만 허용됩니다.' }); return; }
+
+  let body = req.body;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
+  const { mode = 'openai', question = '', context = {}, synthesize = false } = body || {};
+
+  if (!question.trim()) { res.status(400).json({ error: 'question(질문)이 비어 있습니다.' }); return; }
+
+  // ★ 시스템 프롬프트뿐 아니라 사용자 질문 바로 앞에도 같은 지시를 한 번 더 붙입니다.
+  // 모델이 대화의 뒷부분(최신 지시)을 더 강하게 따르는 경향이 있어, 이중 안전장치입니다.
+  const askedQuestion =
+    '(반드시 시스템 컨텍스트에 있는 거래사례만 사용해 답하세요. 목록에 없는 건물명이나 ' +
+    '당신이 알고 있는 실제 뉴스 속 매각 사례는 절대 언급하지 마세요.)\n\n' + question;
+
+  // ★ v12.6 — 가벼운 요약 컨텍스트(sysLight, 클라이언트가 보낸 상위 12건)와,
+  // 구글시트 원본 전체를 서버가 직접 조회해 만든 상세 컨텍스트(sysFull)를 분리합니다.
+  // Groq는 무료 토큰 한도가 좁아 항상 sysLight만 쓰고, GPT·Gemini는 가능하면
+  // sysFull(전체 시트 기반 상세분석)을 사용합니다.
+  const sysLight = buildSystemPrompt(context);
+  let sysFull = sysLight;
+  if (context && context.apps_script_url) {
+    try {
+      const sheetDeals = await fetchSheetDeals(context.apps_script_url);
+      if (sheetDeals && sheetDeals.length) {
+        sysFull = buildSystemPrompt(Object.assign({}, context, {
+          deals: sheetDeals,
+          deals_source: '구글시트 원본 전체(' + sheetDeals.length + '건, 실시간 조회)'
+        }));
+      }
+    } catch (e) {
+      console.warn('[ai-compare] 구글시트 직접 조회 실패, 요약 컨텍스트로 대체:', e.message);
+      // 실패해도 조용히 sysLight로 진행 — 자비스 자체가 멈추지 않도록
+    }
+  }
+
+  try {
+    if (mode === 'compare') {
+      const [openai, gemini, groq] = await Promise.all([callOpenAI(sysFull, askedQuestion), callGemini(sysFull, askedQuestion), callGroq(sysLight, askedQuestion)]);
+      let consensus = { ok: false, error: '종합판정을 생성하지 못했습니다.' };
+      if (synthesize && (openai.ok || gemini.ok || groq.ok)) {
+        const summaryQ =
+          '아래는 같은 부동산 자문 질문에 대한 3개 AI의 답변입니다. ' +
+          '① 공통 결론 ② 의견이 갈리는 지점 ③ 최종 권고 순서로 한국어로 간결히 정리해줘.\n\n' +
+          '[질문]\n' + question + '\n\n' +
+          '[GPT]\n' + (openai.text || openai.error) + '\n\n' +
+          '[Gemini]\n' + (gemini.text || gemini.error) + '\n\n' +
+          '[Groq]\n' + (groq.text || groq.error);
+        const c = await callOpenAI(sysFull, summaryQ, true);
+        consensus = c.ok ? { ok: true, text: c.text } : { ok: false, error: c.error };
+      }
+      res.status(200).json({ mode: 'compare', results: { openai, gemini, groq }, consensus });
+      return;
+    }
+
+    const fn = mode === 'gemini' ? callGemini : mode === 'groq' ? callGroq : callOpenAI;
+    const sysForMode = mode === 'groq' ? sysLight : sysFull;
+    const result = await fn(sysForMode, askedQuestion);
+    res.status(200).json({ mode, result });
+  } catch (e) {
+    res.status(500).json({ error: e.message || '서버 오류가 발생했습니다.' });
+  }
+}
+
+// ── 구글시트(Apps Script Web App) 원본을 서버가 직접 조회 ──
+// 대시보드가 거래사례를 불러올 때 쓰는 것과 동일한 주소를 그대로 사용합니다.
+// 응답 형식: { data: [[...header...], [no, name, addr1, addr2, lat, lng, uc, use,
+//   zone, price, gfaP, gfaSqm, gU, gUm, lanP, lanSqm, lU, lUm, ratio, year, date,
+//   fav, tags, story, storyEn, curatorUrl, nameEn, rooms], ...] }
+var SHEET_COL = {
+  name: 1, addr1: 2, use: 7, zone: 8, price: 9, gfaP: 10, gU: 12,
+  lanP: 14, lU: 16, ratio: 18, year: 19, date: 20, tags: 22, story: 23
+};
+async function fetchSheetDeals(appsScriptUrl) {
+  var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = controller ? setTimeout(function () { controller.abort(); }, 12000) : null;
+  try {
+    var r = await fetch(appsScriptUrl, controller ? { signal: controller.signal } : undefined);
+    if (!r.ok) throw new Error('시트 조회 HTTP ' + r.status);
+    var j = await r.json();
+    if (j && j.error) throw new Error(j.error);
+    var rows = (j && j.data) || [];
+    var dataStart = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (/^\d+$/.test(String((rows[i] || [])[0] || '').trim())) { dataStart = i; break; }
+    }
+    var dataRows = rows.slice(dataStart);
+    var deals = dataRows.map(function (row) {
+      function num(v) { var n = parseFloat(String(v == null ? '' : v).replace(/[,\s]/g, '')); return isNaN(n) ? 0 : n; }
+      var story = String(row[SHEET_COL.story] || '').replace(/<[^>]+>/g, '').trim();
+      return {
+        name: String(row[SHEET_COL.name] || ''),
+        address: String(row[SHEET_COL.addr1] || ''),
+        use: String(row[SHEET_COL.use] || ''),
+        zone: String(row[SHEET_COL.zone] || ''),
+        price_eok: num(row[SHEET_COL.price]),
+        gfa_py: num(row[SHEET_COL.gfaP]),
+        gfa_unit_price: num(row[SHEET_COL.gU]),
+        land_py: num(row[SHEET_COL.lanP]),
+        land_unit_price: num(row[SHEET_COL.lU]),
+        assessed_value_ratio: num(row[SHEET_COL.ratio]),
+        built_year: num(row[SHEET_COL.year]),
+        close_date: String(row[SHEET_COL.date] || ''),
+        tags: String(row[SHEET_COL.tags] || ''),
+        story_summary: story.slice(0, 150)
+      };
+    }).filter(function (d) { return d.name; });
+    // 전체를 다 보내면 토큰이 과도해질 수 있어, 거래금액 상위 60건으로 캡핑
+    deals.sort(function (a, b) { return b.price_eok - a.price_eok; });
+    return deals.slice(0, 60);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function buildSystemPrompt(context) {
+  var ctxObj = Object.assign({}, context || {});
+  var dealsArr = Array.isArray(ctxObj.deals) ? ctxObj.deals : [];
+  var names = dealsArr.map(function (d) { return d && d.name; }).filter(Boolean);
+  var listingsArr = Array.isArray(ctxObj.sale_listings) ? ctxObj.sale_listings : [];
+  var listingNames = listingsArr.map(function (s) { return s && s.name; }).filter(Boolean);
+  var allNames = names.concat(listingNames);
+  var ctx = JSON.stringify(ctxObj).slice(0, 9000);
+  return (
+    '당신은 BSKIT DealBook 대시보드 전용 "폐쇄형(closed-book)" 분석 어시스턴트입니다. ' +
+    '반드시 아래 JSON 컨텍스트 안의 데이터만 사용해 답하고, 당신이 사전에 학습한 실제 서울 ' +
+    '부동산 시장 지식(뉴스로 알려진 매각 사례, 유명 빌딩 거래가 등)은 이 답변에 절대 끌어오지 ' +
+    '마세요. 컨텍스트에 포함된 거래사례·매물은 총 ' + allNames.length + '건이며, ' +
+    '당신이 답변에서 언급할 수 있는 건물명·매물명은 오직 다음 목록뿐입니다: [' +
+    allNames.join(', ') + ']. 이 목록에 없는 건물명·회사명·금액·뉴스는 단 하나도 등장시키지 ' +
+    '마세요. 목록 안에서 조건에 맞는 항목을 찾지 못하면 반드시 "제공된 데이터에는 해당 조건에 ' +
+    '맞는 거래사례가 없습니다"라고 명확히 답하고, 절대로 목록 밖의 사례로 대신 채우지 마세요. ' +
+    '숫자를 인용할 때는 반드시 컨텍스트의 값을 그대로 사용하세요. ' +
+    '사용자가 금액·면적 등 특정 조건(예: "500억 미만", "1000평 이상")으로 거래사례를 골라달라고 ' +
+    '요청하면, 목록에 넣기 전에 각 항목의 해당 숫자 필드가 그 조건을 실제로 만족하는지 하나씩 ' +
+    '반드시 검산하세요. 조건에 맞지 않는 항목은 절대 포함하지 말고, 목록 작성 후에도 한 번 더 ' +
+    '전체 항목이 조건을 만족하는지 확인한 다음 답하세요. ' +
+    '답변 형식: 마크다운 표(|---|---|)나 HTML 태그(<br> 등)는 절대 쓰지 마세요. 이 화면은 ' +
+    '일반 텍스트만 표시하므로, 목록은 "- " 글머리 기호와 줄바꿈만 사용해 간결하게 정리하고, ' +
+    '강조하고 싶은 부분만 **굵게**로 표시하세요.\n\n' +
+    '컨텍스트: ' + ctx
+  );
+}
+
+async function callOpenAI(sys, question, isSummary) {
+  var key = (process.env.OPENAI_API_KEY||"").trim();
+  if (!key) return { ok: false, error: 'OPENAI_API_KEY가 서버에 설정되지 않았습니다.', model: 'gpt' };
+  try {
+    var r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: isSummary ? '당신은 여러 AI 답변을 종합하는 편집자입니다.' : sys },
+          { role: 'user', content: question }
+        ],
+        temperature: 0.3,
+        max_tokens: 700
+      })
+    });
+    var j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+    var text = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '(응답 없음)';
+    return { ok: true, text: text, model: 'gpt-4o-mini' };
+  } catch (e) {
+    return { ok: false, error: e.message, model: 'gpt' };
+  }
+}
+
+async function callGemini(sys, question) {
+  var key = (process.env.GEMINI_API_KEY||"").trim();
+  if (!key) return { ok: false, error: 'GEMINI_API_KEY가 서버에 설정되지 않았습니다.', model: 'gemini' };
+  try {
+    // 무료 티어에서 신규 사용자에게 열려 있는 최신 Flash 모델로 지정합니다.
+    // (2.5-flash는 신규 사용자 제한 → 구글 안내에 따라 3.6-flash 사용)
+    var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=' + key;
+    // gemini-3.6-flash는 기본적으로 "내부 추론(thinking)"에 답변 토큰 예산을
+    // 먼저 소모합니다. thinkingConfig(thinkingBudget:0) 옵션이 이 모델에서
+    // "invalid argument"로 거부되어 아예 실패했던 적이 있어, 옵션은 빼고
+    // 상한만 넉넉히(2000) 올려 추론 후에도 답변 쓸 공간을 확보합니다.
+    var r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: sys + '\n\n질문: ' + question }] }],
+        generationConfig: { maxOutputTokens: 2000 }
+      })
+    });
+    var j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+    var cand = (j.candidates && j.candidates[0]) || {};
+    var parts = (cand.content && cand.content.parts) || [];
+    var text = parts.map(function (p) { return p.text || ''; }).join('');
+    if (!text) text = '(응답 없음' + (cand.finishReason ? ' · 종료사유: ' + cand.finishReason : '') + ')';
+    return { ok: true, text: text, model: 'gemini-3.6-flash' };
+  } catch (e) {
+    return { ok: false, error: e.message, model: 'gemini' };
+  }
+}
+
+async function callGroq(sys, question) {
+  var key = (process.env.GROQ_API_KEY||"").trim();
+  if (!key) return { ok: false, error: 'GROQ_API_KEY가 서버에 설정되지 않았습니다.', model: 'groq' };
+  try {
+    // Groq는 OpenAI 호환 엔드포인트를 제공하며, 완전 무료 티어(카드 등록 불필요)입니다.
+    // 모델 목록: https://console.groq.com/docs/models  (지원 종료 확인: /docs/deprecations)
+    // gpt-oss 계열은 "추론(reasoning) 모델"이라 max_tokens 예산을 추론에 먼저
+    // 쓰고 나면 실제 답변이 비어버릴 수 있습니다. reasoning_effort를 낮추고
+    // max_tokens을 넉넉히 줘서 답변까지 여유를 확보합니다.
+    var r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-20b',
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: question }
+        ],
+        temperature: 0.3,
+        max_tokens: 900,
+        reasoning_effort: 'low'
+      })
+    });
+    var j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+    var choice = (j.choices && j.choices[0]) || {};
+    var text = (choice.message && choice.message.content) || '';
+    if (!text) text = '(응답 없음' + (choice.finish_reason ? ' · 종료사유: ' + choice.finish_reason : '') + ')';
+    return { ok: true, text: text, model: 'gpt-oss-20b (Groq)' };
+  } catch (e) {
+    return { ok: false, error: e.message, model: 'groq' };
+  }
+}

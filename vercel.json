@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/workplace-population.js": {
+      "maxDuration": 60
+    },
+    "api/ai-compare.js": {
+      "maxDuration": 30
+    }
+  }
+}
