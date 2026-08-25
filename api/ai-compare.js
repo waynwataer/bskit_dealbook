@@ -9,9 +9,14 @@
 module.exports = async function handler(req, res) {
   // 티스토리(외부 도메인)에서 오는 요청을 허용
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Cache-Control', 'no-store');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method === 'GET') {
+    res.status(200).json({ ok: true, service: 'bskit-ai-compare', version: '13.4', methods: ['POST'] });
+    return;
+  }
   if (req.method !== 'POST') { res.status(405).json({ error: 'POST 요청만 허용됩니다.' }); return; }
 
   let body = req.body;
