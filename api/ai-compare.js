@@ -1,6 +1,6 @@
 // api/ai-compare.js
 // BSKIT DealBook의 "BSKIT AI Analyst"가 호출하는 백엔드.
-// API 키(OPENAI_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY)는 절대 대시보드
+// API 키(OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY)는 절대 대시보드
 // HTML에 넣지 않고, 이 서버(Vercel 프로젝트)의 환경변수로만 보관합니다.
 //
 // 대시보드 CONFIG.AI_COMPARE_ENDPOINT 에는 이 함수가 배포된 주소를 넣습니다.
@@ -277,64 +277,86 @@ var NEWS_DOMAINS = ['dealbook.co.kr', 'thebell.co.kr'];
 async function callOpenAINews(question, context) {
   var key = (process.env.OPENAI_API_KEY || '').trim();
   if (!key) return { ok: false, error: 'OPENAI_API_KEY가 서버에 설정되지 않았습니다.', model: 'news' };
+
+  var selected = context && context.selected_deal;
+  var hint = selected && selected.name
+    ? ('참고로 사용자가 대시보드에서 보고 있는 거래사례는 "' + selected.name + '"' +
+       (selected.address ? ' (' + selected.address + ')' : '') + '입니다. 관련성이 있을 때 검색어에 포함하세요.\n\n')
+    : '';
+  var newsSys =
+    '당신은 한국 상업용 부동산 전문 뉴스 리서치 어시스턴트입니다. ' +
+    '검색 결과 중 dealbook.co.kr(딜북)과 thebell.co.kr(더벨) 기사만 최종 근거로 사용하세요. ' +
+    '다른 도메인이 검색되더라도 답변 근거로 채택하지 마세요. 관련 기사가 없으면 솔직하게 없다고 말하세요. ' +
+    '답변 끝에는 실제로 참고한 기사 제목과 링크를 - 글머리로 적으세요.';
+
+  var preferredModel = (process.env.OPENAI_NEWS_MODEL || 'gpt-5.4-mini').trim();
+  var fallbackModel = (process.env.OPENAI_NEWS_FALLBACK_MODEL || 'gpt-4o-mini').trim();
+
   try {
-    var selected = context && context.selected_deal;
-    var hint = selected && selected.name
-      ? ('참고로 사용자가 대시보드에서 보고 있는 거래사례는 "' + selected.name + '"' +
-         (selected.address ? ' (' + selected.address + ')' : '') + '입니다. 관련이 있다면 검색어에 참고하세요.\n\n')
-      : '';
-    var newsSys =
-      '당신은 한국 상업용 부동산·M&A 전문 뉴스 리서치 어시스턴트입니다. ' +
-      '반드시 검색 도구로 찾은 dealbook.co.kr, thebell.co.kr 두 사이트의 실제 기사 내용만 ' +
-      '근거로 답하세요. 검색 결과에 없는 내용은 추측하지 말고 "관련 기사를 찾지 못했습니다"라고 ' +
-      '답하세요. 답변 끝에는 참고한 기사 제목과 링크를 목록으로 정리하세요. 마크다운 표나 ' +
-      'HTML 태그는 쓰지 말고 "- " 글머리 기호만 사용하세요.';
+    return await runNewsResponse(preferredModel, true, key, newsSys, hint + question);
+  } catch (e1) {
+    var msg = String(e1 && e1.message || e1);
+    var filterRelated = /filters|allowed_domains|web_search.*not supported|invalid.*tool/i.test(msg);
+    if (!filterRelated) return { ok: false, error: msg, model: 'news' };
+    try {
+      return await runNewsResponse(fallbackModel, false, key, newsSys, hint + question);
+    } catch (e2) {
+      return { ok: false, error: String(e2 && e2.message || e2), model: 'news' };
+    }
+  }
+}
 
-    var r = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        input: [
-          { role: 'system', content: newsSys },
-          { role: 'user', content: hint + question }
-        ],
-        tools: [{ type: 'web_search', filters: { allowed_domains: NEWS_DOMAINS } }],
-        tool_choice: 'required',
-        max_output_tokens: 1500
-      })
-    });
-    var j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+async function runNewsResponse(model, useFilters, key, systemText, userText) {
+  var tool = { type: 'web_search' };
+  if (useFilters) tool.filters = { allowed_domains: NEWS_DOMAINS };
+  var r = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+    body: JSON.stringify({
+      model: model,
+      input: [
+        { role: 'system', content: systemText },
+        { role: 'user', content: userText }
+      ],
+      tools: [tool],
+      tool_choice: 'auto',
+      max_output_tokens: 1400
+    })
+  });
+  var j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
 
-    var text = j.output_text || '';
-    var sources = [];
-    var didSearch = false;
-    (j.output || []).forEach(function (item) {
-      if (item && (item.type === 'web_search_call' || item.type === 'web_search')) didSearch = true;
-      (item && item.content || []).forEach(function (c) {
-        if (c && c.text && !text) text += c.text;
-        (c && c.annotations || []).forEach(function (a) {
-          if (a && a.url) sources.push({ url: a.url, title: a.title || a.url });
-        });
+  var textParts = [];
+  var sources = [];
+  var didSearch = false;
+  (j.output || []).forEach(function (item) {
+    if (item && (item.type === 'web_search_call' || item.type === 'web_search')) didSearch = true;
+    (item && item.content || []).forEach(function (c) {
+      if (c && c.text) textParts.push(c.text);
+      (c && c.annotations || []).forEach(function (a) {
+        if (a && a.url) sources.push({ url: a.url, title: a.title || a.url });
       });
     });
-    if (!text) {
-      text = didSearch
-        ? '(딜북·더벨에서 검색은 했지만 관련 기사를 찾지 못했습니다.)'
-        : '(웹 검색이 실행되지 않았습니다. OpenAI 계정에서 web_search 도구 사용이 제한되었을 수 있습니다.)';
-    }
-    if (sources.length) {
-      var seen = {};
-      var lines = sources.filter(function (s) { if (seen[s.url]) return false; seen[s.url] = 1; return true; })
-        .slice(0, 6)
-        .map(function (s) { return '- ' + s.title + ' — ' + s.url; });
-      text += '\n\n[참고 기사]\n' + lines.join('\n');
-    }
-    return { ok: true, text: text, model: 'gpt-4o-mini + web_search' + (didSearch ? ' ✓검색함' : ' ✗검색안함') };
-  } catch (e) {
-    return { ok: false, error: e.message, model: 'news' };
+  });
+  var text = String(j.output_text || textParts.join('\n') || '').trim();
+  if (!text) text = didSearch ? '딜북·더벨에서 검색했지만 관련 기사를 찾지 못했습니다.' : '웹 검색이 실행되지 않았습니다.';
+
+  var seen = {};
+  var allowed = sources.filter(function (s) {
+    try {
+      var host = new URL(s.url).hostname.toLowerCase().replace(/^www\./, '');
+      if (NEWS_DOMAINS.indexOf(host) < 0) return false;
+      if (seen[s.url]) return false;
+      seen[s.url] = 1;
+      return true;
+    } catch (e) { return false; }
+  }).slice(0, 6);
+  if (allowed.length) {
+    text += '\n\n[참고 기사]\n' + allowed.map(function (s) { return '- ' + s.title + ' — ' + s.url; }).join('\n');
+  } else if (didSearch) {
+    text += '\n\n[참고 기사]\n- 딜북·더벨 도메인에서 인용 가능한 링크를 확인하지 못했습니다.';
   }
+  return { ok: true, text: text, model: model + ' + web_search' + (useFilters ? ' (도메인필터)' : ' (후처리필터)') };
 }
 
 // ══════════════════════════════════════════════════════════
@@ -394,23 +416,84 @@ function driveAuth() {
     });
 }
 
-function driveSearchFiles(token, query) {
-  var folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
-  var terms = String(query || '').split(/\s+/).filter(function (t) { return t && t.length >= 2; }).slice(0, 5);
-  var qParts = terms.map(function (t) { return "fullText contains '" + t.replace(/'/g, "\\'") + "'"; });
-  var q = qParts.length ? '(' + qParts.join(' or ') + ')' : "mimeType != 'application/vnd.google-apps.folder'";
-  q += " and trashed = false";
-  if (folderId) q += " and '" + folderId + "' in parents";
+function normalizeDriveFolderId(raw) {
+  var v = String(raw || '').trim();
+  if (!v || v === '.' || v === '/' || v.toLowerCase() === 'root') return '';
+  var m = v.match(/\/folders\/([A-Za-z0-9_-]+)/);
+  if (m) return m[1];
+  var m2 = v.match(/[?&]id=([A-Za-z0-9_-]+)/);
+  if (m2) return m2[1];
+  return v;
+}
+
+function driveListRequest(token, q, pageSize) {
   var url = 'https://www.googleapis.com/drive/v3/files?' +
     'q=' + encodeURIComponent(q) +
-    '&fields=' + encodeURIComponent('files(id,name,mimeType,webViewLink,modifiedTime)') +
-    '&pageSize=8&orderBy=modifiedTime desc';
+    '&fields=' + encodeURIComponent('files(id,name,mimeType,webViewLink,modifiedTime,parents),nextPageToken') +
+    '&pageSize=' + (pageSize || 100) +
+    '&orderBy=modifiedTime desc&spaces=drive&includeItemsFromAllDrives=true&supportsAllDrives=true';
   return fetch(url, { headers: { Authorization: 'Bearer ' + token } })
     .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
     .then(function (res2) {
-      if (!res2.ok) throw new Error((res2.j && res2.j.error && res2.j.error.message) || 'Drive 검색 실패');
+      if (!res2.ok) throw new Error((res2.j && res2.j.error && res2.j.error.message) || 'Drive 목록 조회 실패');
       return (res2.j && res2.j.files) || [];
     });
+}
+
+async function driveListTree(token, folderId, maxDepth, maxFiles) {
+  var files = [], queue = [{ id: folderId, depth: 0 }], seenFolders = {};
+  maxDepth = maxDepth == null ? 3 : maxDepth;
+  maxFiles = maxFiles || 160;
+  while (queue.length && files.length < maxFiles) {
+    var cur = queue.shift();
+    if (seenFolders[cur.id]) continue;
+    seenFolders[cur.id] = 1;
+    var children = await driveListRequest(token, "'" + cur.id.replace(/'/g, "\\'") + "' in parents and trashed = false", 100);
+    children.forEach(function (f) {
+      if (f.mimeType === 'application/vnd.google-apps.folder') {
+        if (cur.depth < maxDepth) queue.push({ id: f.id, depth: cur.depth + 1 });
+      } else if (files.length < maxFiles) files.push(f);
+    });
+  }
+  return files;
+}
+
+function driveTerms(query, context) {
+  var extra = [];
+  var sd = context && context.selected_deal;
+  var sl = context && context.selected_listing;
+  if (sd) extra.push(sd.name, sd.address);
+  if (sl) extra.push(sl.name, sl.address);
+  var raw = [query].concat(extra).filter(Boolean).join(' ');
+  var stop = { '현재':1,'선택한':1,'거래사례':1,'매매사례':1,'매물':1,'관련':1,'문서':1,'자료':1,'분석':1,'해주세요':1,'찾아줘':1,'찾아':1,'대해':1 };
+  var toks = raw.replace(/[()\[\]{},.:;!?/\\]/g, ' ').split(/\s+/).map(function (t) { return t.trim(); })
+    .filter(function (t) { return t.length >= 2 && !stop[t]; });
+  var seen = {};
+  return toks.filter(function (t) { var k=t.toLowerCase(); if(seen[k])return false; seen[k]=1; return true; }).slice(0, 10);
+}
+
+function scoreTextByTerms(text, terms) {
+  var s = String(text || '').toLowerCase(), score = 0;
+  terms.forEach(function (t) {
+    var q = String(t).toLowerCase();
+    if (!q) return;
+    if (s.indexOf(q) >= 0) score += q.length >= 5 ? 5 : 3;
+  });
+  return score;
+}
+
+async function driveSearchFiles(token, query, context) {
+  var folderId = normalizeDriveFolderId(process.env.GOOGLE_DRIVE_FOLDER_ID || '');
+  var all;
+  if (folderId) all = await driveListTree(token, folderId, 3, 160);
+  else all = await driveListRequest(token, "trashed = false and mimeType != 'application/vnd.google-apps.folder'", 100);
+  var terms = driveTerms(query, context);
+  all.forEach(function (f) { f._nameScore = scoreTextByTerms(f.name, terms) * 3; });
+  all.sort(function (a, b) {
+    if (b._nameScore !== a._nameScore) return b._nameScore - a._nameScore;
+    return String(b.modifiedTime || '').localeCompare(String(a.modifiedTime || ''));
+  });
+  return all.slice(0, 16);
 }
 
 var DRIVE_EXPORTABLE = {
@@ -437,29 +520,46 @@ function driveFetchFileText(token, file) {
 async function callGoogleDrive(question, context) {
   try {
     var token = await driveAuth();
-    var files = await driveSearchFiles(token, question);
-    if (!files.length) {
-      return { ok: true, text: '연결된 구글드라이브 폴더에서 이 질문과 관련된 파일을 찾지 못했습니다.', model: 'Google Drive' };
+    var candidates = await driveSearchFiles(token, question, context);
+    if (!candidates.length) {
+      var folderId = normalizeDriveFolderId(process.env.GOOGLE_DRIVE_FOLDER_ID || '');
+      return { ok: true, text: folderId
+        ? '연결된 구글드라이브 폴더에서 파일을 찾지 못했습니다. 서비스 계정에 해당 폴더가 뷰어 이상으로 공유되어 있는지 확인해 주세요.'
+        : '서비스 계정이 읽을 수 있는 구글드라이브 파일을 찾지 못했습니다. 검색할 폴더를 서비스 계정 이메일에 공유해 주세요.', model: 'Google Drive' };
     }
-    var top = files.slice(0, 4);
-    var texts = await Promise.all(top.map(function (f) { return driveFetchFileText(token, f); }));
-    var docsBlock = top.map(function (f, i) {
-      return '[파일: ' + f.name + ']\n' + String(texts[i] || '').slice(0, 2500);
-    }).join('\n\n---\n\n');
+
+    var inspect = candidates.slice(0, 10);
+    var texts = await Promise.all(inspect.map(function (f) { return driveFetchFileText(token, f); }));
+    var terms = driveTerms(question, context);
+    var ranked = inspect.map(function (f, i) {
+      return { file: f, text: String(texts[i] || ''), score: (f._nameScore || 0) + scoreTextByTerms(texts[i], terms) };
+    }).sort(function (a, b) {
+      if (b.score !== a.score) return b.score - a.score;
+      return String(b.file.modifiedTime || '').localeCompare(String(a.file.modifiedTime || ''));
+    });
+    var top = ranked.slice(0, 5);
+
+    var docsBlock = top.map(function (x) {
+      return '[파일: ' + x.file.name + ']\n' + (x.text || '(본문 미리보기 미지원)');
+    }).join('\n\n---\n\n').slice(0, 14000);
 
     var sys =
       '당신은 BSKIT DealBook의 구글드라이브 문서 검색 어시스턴트입니다. ' +
-      '아래 [문서] 내용에서 확인되는 사실만 근거로 한국어로 답하고, 문서에 없는 내용은 ' +
-      '추측하지 말고 "문서에서 확인되지 않습니다"라고 밝히세요. 마크다운 표나 HTML 태그는 ' +
-      '쓰지 말고 "- " 글머리 기호만 사용하세요.\n\n[문서]\n' + docsBlock;
+      '아래 [문서]에서 확인되는 사실만 근거로 한국어로 답하고, 문서에 없는 내용은 추측하지 마세요. ' +
+      '질문과 직접 관련도가 낮은 파일은 배제하세요. 표 대신 - 글머리 기호를 사용하세요.\n\n[문서]\n' + docsBlock;
 
     var key = (process.env.OPENAI_API_KEY || '').trim();
-    if (!key) return { ok: false, error: 'OPENAI_API_KEY가 서버에 설정되지 않았습니다.', model: 'drive' };
+    if (!key) {
+      var rawLines = top.map(function (x) { return '- ' + x.file.name + ' — ' + (x.file.webViewLink || ''); });
+      return { ok: true, text: '구글드라이브에서 관련 가능성이 높은 파일을 찾았습니다. AI 요약은 OPENAI_API_KEY가 없어 생략합니다.\n\n' + rawLines.join('\n'), model: 'Google Drive 검색' };
+    }
+
+    var driveModel = (process.env.OPENAI_DRIVE_MODEL || 'gpt-4o-mini').trim();
     var r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: driveModel,
         messages: [{ role: 'system', content: sys }, { role: 'user', content: question }],
         temperature: 0.2,
         max_tokens: 900
@@ -468,10 +568,13 @@ async function callGoogleDrive(question, context) {
     var j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
     var text = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '(응답 없음)';
-    var linkLines = top.map(function (f) { return '- ' + f.name + ' — ' + (f.webViewLink || ''); });
+    var linkLines = top.map(function (x) { return '- ' + x.file.name + ' — ' + (x.file.webViewLink || ''); });
     text += '\n\n[참고 파일]\n' + linkLines.join('\n');
-    return { ok: true, text: text, model: 'gpt-4o-mini + Google Drive(' + top.length + '개 파일)' };
+    return { ok: true, text: text, model: 'Google Drive + ' + driveModel + ' (' + top.length + '개 후보)' };
   } catch (e) {
-    return { ok: false, error: e.message, model: 'drive' };
+    var msg = String(e && e.message || e);
+    if (/File not found:\s*\./i.test(msg)) msg = 'GOOGLE_DRIVE_FOLDER_ID 값이 잘못되었습니다. 점(.) 대신 실제 폴더 ID/폴더 URL을 넣거나 환경변수를 비워 주세요.';
+    return { ok: false, error: msg, model: 'drive' };
   }
 }
+

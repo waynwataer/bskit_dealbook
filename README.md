@@ -1,169 +1,178 @@
-# BSKIT DealBook 백엔드 (3AI 비교 + 직장인구 프록시)
+# BSKIT DealBook Backend v13.3
 
-BSKIT DealBook 대시보드의 두 기능을 실제로 동작시키기 위한 최소 백엔드입니다.
+`dealbook_v13.3.html`의 AI 검색과 SGIS 직장인구 레이어를 위한 Vercel 서버리스 백엔드입니다.
 
-- `api/ai-compare.js` — GPT · Gemini · Claude 3AI 비교 분석
-- `api/workplace-population.js` — 통계청 SGIS 직장인구(종사자수) 프록시
+- `api/ai-compare.js` — GPT · Gemini · Groq · 자비스 + 뉴스검색 + Google Drive 검색
+- `api/workplace-population.js` — SGIS 전국사업체조사 종사자수 + 행정동 경계 병합, EPSG:5179 → WGS84 변환
+- `api/health.js` — API 키/Drive/SGIS 설정 여부만 확인하는 진단 엔드포인트(비밀값은 반환하지 않음)
 
-두 함수 모두 **API 키를 서버 환경변수로만 사용**하므로, 대시보드 HTML에는 어떤 키도
-들어가지 않습니다.
+API 키와 인증정보는 **HTML에 넣지 말고 Vercel Environment Variables에만** 저장하세요.
 
 ---
 
-## 1. 배포하기 (Vercel, 무료 플랜으로 충분)
+## 1. 이번 v13.3에서 수정한 문제
 
-### 방법 A — GitHub 연동 (권장)
-1. 이 폴더(`bskit-backend`)를 본인 GitHub 저장소로 올립니다.
-2. https://vercel.com 가입 → **Add New → Project** → 방금 만든 저장소 선택 → **Deploy**
-   (Framework Preset은 "Other"로 두면 됩니다. 별도 빌드 설정이 필요 없습니다.)
-3. 배포가 끝나면 `https://프로젝트이름.vercel.app` 형태의 주소가 발급됩니다.
+### 뉴스 검색
+기존 코드는 `gpt-4o-mini`에 `web_search.filters.allowed_domains`를 함께 전달해 계정/모델 조합에 따라
+`Parameter 'filters' not supported ...` 오류가 발생했습니다.
 
-### 방법 B — Vercel CLI로 바로 배포
-```bash
-npm i -g vercel
-cd bskit-backend
-vercel        # 최초 1회, 안내에 따라 로그인/프로젝트 생성
-vercel --prod # 운영 배포
+v13.3은:
+1. `gpt-5.4-mini` + 도메인 필터를 우선 시도
+2. 필터/툴 호환 오류가 발생하면 `gpt-4o-mini` + 필터 없는 웹검색으로 자동 재시도
+3. 최종 인용 링크는 `dealbook.co.kr`, `thebell.co.kr`만 후처리해 표시
+
+### Google Drive 검색
+기존 `GOOGLE_DRIVE_FOLDER_ID='.'` 같은 값은 Google Drive API에서 `File not found: .`를 발생시킵니다.
+또한 자연어 질문 전체를 `fullText contains` 조건으로 넣으면 한글 질의에서 파일을 지나치게 많이 놓칠 수 있습니다.
+
+v13.3은:
+- `.`, `/`, `root`, 공백을 "폴더 제한 없음"으로 처리
+- 폴더 URL을 넣어도 ID를 자동 추출
+- 지정 폴더 아래 하위 폴더를 최대 3단계 재귀 검색
+- 질문 + 선택한 매매사례/매물명/주소로 로컬 관련도 점수 계산
+- 상위 문서 본문까지 읽은 뒤 다시 관련도 정렬
+- OpenAI 키가 없어도 파일명/링크 검색 결과는 반환
+
+### SGIS 직장인구
+SGIS 경계 좌표는 EPSG:5179(UTM-K)인데 Kakao Map은 경위도(WGS84)를 사용합니다.
+기존 버전은 SGIS 좌표를 그대로 `LatLng`에 넣어 실제 데이터가 있어도 폴리곤이 지도 밖에 그려질 수 있었습니다.
+
+v13.3은 Vercel 서버에서 `proj4`로 **EPSG:5179 → EPSG:4326** 변환 후 GeoJSON을 반환합니다.
+또한 `low_search=1`, API의 `errCd`, 빈 결과 캐시 방지, 2024 기본연도 및 1년 자동 fallback을 추가했습니다.
+
+---
+
+## 2. Vercel 환경변수
+
+Vercel → Project → **Settings → Environment Variables**에서 등록합니다.
+
+### AI
+
+| 변수명 | 필수 | 설명 |
+|---|---:|---|
+| `OPENAI_API_KEY` | 뉴스/GPT 사용 시 | GPT 분석, 뉴스 검색, Drive 문서 요약 |
+| `GEMINI_API_KEY` | 선택 | Gemini |
+| `GROQ_API_KEY` | 선택 | Groq |
+| `OPENAI_NEWS_MODEL` | 선택 | 기본 `gpt-5.4-mini` |
+| `OPENAI_NEWS_FALLBACK_MODEL` | 선택 | 기본 `gpt-4o-mini` |
+| `OPENAI_DRIVE_MODEL` | 선택 | 기본 `gpt-4o-mini` |
+
+### Google Drive
+
+| 변수명 | 필수 | 설명 |
+|---|---:|---|
+| `GOOGLE_SERVICE_ACCOUNT_EMAIL` | 예 | 서비스 계정 JSON의 `client_email` |
+| `GOOGLE_SERVICE_ACCOUNT_KEY` | 예 | JSON의 `private_key` 전체 |
+| `GOOGLE_DRIVE_FOLDER_ID` | 선택 | 실제 폴더 ID 또는 Google Drive 폴더 URL. **`.` 입력 금지** |
+
+서비스 계정 이메일을 Google Drive의 검색 대상 폴더에 **뷰어**로 공유해야 합니다.
+`GOOGLE_DRIVE_FOLDER_ID`를 비우면 서비스 계정에 공유되어 검색 가능한 파일을 대상으로 검색합니다.
+
+지원 본문 추출:
+- Google Docs → text/plain
+- Google Sheets → CSV
+- Google Slides → text/plain
+- txt/csv → 직접 읽기
+- PDF/Word/이미지 → 현재 버전에서는 파일명/링크만 사용
+
+### SGIS 직장인구
+
+| 변수명 | 필수 | SGIS 발급 화면의 명칭 |
+|---|---:|---|
+| `SGIS_CONSUMER_KEY` | 예 | **서비스 ID** |
+| `SGIS_CONSUMER_SECRET` | 예 | **보안 Key** |
+| `SGIS_STATS_YEAR` | 선택 | 기본 `2024` |
+
+SGIS 인증정보는 대시보드 HTML에 넣지 않습니다. Vercel에만 보관합니다.
+
+> 인증키/보안키가 스크린샷·채팅·공개 저장소에 노출된 적이 있다면 기존 값을 폐기 또는 재발급한 뒤 새 값을 Vercel에 등록하세요.
+
+---
+
+## 3. 배포
+
+GitHub 저장소에서 다음 파일을 교체/추가합니다.
+
+```text
+api/ai-compare.js
+api/workplace-population.js
+api/health.js
+package.json
+vercel.json
 ```
 
-## 2. 환경변수 등록
+`package.json`에 `proj4`가 추가되었으므로 **package.json도 반드시 같이 배포**해야 합니다.
 
-Vercel 프로젝트 → **Settings → Environment Variables**에서 아래 값을 등록하세요.
-(전부 채울 필요는 없습니다 — 없는 항목은 해당 AI만 "미설정"으로 표시되고, 나머지는 정상 동작합니다.)
+그 후 Vercel에서 **Redeploy** 합니다.
 
-| 변수명 | 용도 | 발급처 |
-|---|---|---|
-| `OPENAI_API_KEY` | GPT 비교 분석 | https://platform.openai.com/api-keys |
-| `GEMINI_API_KEY` | Gemini 비교 분석 (무료 티어: gemini-3.6-flash) | https://aistudio.google.com/app/apikey |
-| `GROQ_API_KEY` | Groq 비교 분석 (완전 무료, 카드 등록 불필요, gpt-oss-20b) | https://console.groq.com/keys |
-| `SGIS_CONSUMER_KEY` | 직장인구(SGIS) 조회 | https://sgis.mods.go.kr (2025-10 국가데이터처로 이전) → 개발지원센터에서 발급 |
-| `SGIS_CONSUMER_SECRET` | 직장인구(SGIS) 조회 | 위와 동일 발급 화면 |
-| `SGIS_STATS_YEAR` (선택) | 전국사업체조사 기준년도 | 기본값 `2023`, SGIS 개발자센터에서 최신 연도 확인 |
-
-> **참고 — 안전한 무료 조합**: `GEMINI_API_KEY`와 `GROQ_API_KEY`는 신용카드 등록 없이
-> 발급됩니다. 예상치 못한 청구를 원천 차단하고 싶으시면 이 둘만 등록하고 `OPENAI_API_KEY`는
-> 비워두셔도 됩니다 — GPT 항목만 "미설정"으로 표시되고 Gemini·Groq·3AI 비교(2개 기준)는
-> 정상 동작합니다.
-
-환경변수를 추가/수정한 뒤에는 **Redeploy**를 한 번 눌러야 반영됩니다.
-
-## 3. 대시보드에 연결하기
-
-`dealbook_*.html` 파일 상단 `CONFIG` 블록을 아래처럼 채우고 다시 저장/게시하세요.
+대시보드 CONFIG는 다음 형태입니다.
 
 ```js
-var CONFIG = {
-  ...
-  AI_COMPARE_ENDPOINT: 'https://프로젝트이름.vercel.app/api/ai-compare',
-  WORKPLACE_POP_PROXY_ENDPOINT: 'https://프로젝트이름.vercel.app/api/workplace-population',
-  ...
-};
+AI_COMPARE_ENDPOINT: 'https://dealbook-flame.vercel.app/api/ai-compare',
+WORKPLACE_POP_PROXY_ENDPOINT: 'https://dealbook-flame.vercel.app/api/workplace-population',
+SGIS_STATS_YEAR: '2024'
 ```
 
-- `AI_COMPARE_ENDPOINT`를 넣으면 우측 하단 **BSKIT AI Analyst** 버튼과 지도 팝업의
-  **🤖 AI 분석** 버튼이 바로 동작합니다.
-- `WORKPLACE_POP_PROXY_ENDPOINT`를 넣으면 지도의 **직장인구** 체크박스가 SGIS 데이터를
-  자동으로 불러옵니다. (이 값이 있으면 `SGIS_CONSUMER_KEY`를 대시보드 HTML에 직접
-  넣을 필요가 없습니다 — 서버에만 있으면 됩니다.)
+---
 
-## 4. 동작 확인
+## 4. 배포 후 진단
 
-배포 후 브라우저 주소창에 아래처럼 직접 접속해 응답이 오는지 먼저 확인하면 문제를
-빨리 좁힐 수 있습니다.
+### 전체 설정 진단
+브라우저에서:
 
+```text
+https://YOUR-PROJECT.vercel.app/api/health
 ```
-GET  https://프로젝트이름.vercel.app/api/workplace-population
+
+정상 예시:
+
+```json
+{
+  "ok": true,
+  "drive": {
+    "service_account_email": true,
+    "service_account_key": true,
+    "invalid_dot_value_detected": false
+  },
+  "sgis": {
+    "consumer_key": true,
+    "consumer_secret": true,
+    "year": "2024",
+    "output_crs": "EPSG:4326"
+  }
+}
 ```
-→ `{"type":"FeatureCollection","features":[...]}` 형태의 JSON이 보이면 정상입니다.
 
-`ai-compare`는 POST 전용이라 브라우저 주소창으로는 테스트가 안 되며, 대시보드의
-AI 패널에서 질문을 보내 확인하면 됩니다.
+실제 키 값은 반환하지 않습니다.
 
-## 5. 비용/트래픽 참고
+### SGIS 직접 확인
 
-- Vercel 서버리스 함수는 무료 플랜(Hobby)으로 개인/소규모 사용에 충분합니다.
-- `workplace-population`은 응답에 7일 캐시 헤더(`s-maxage`)를 붙여 두어, 같은 기간
-  내 재요청은 SGIS를 다시 호출하지 않고 캐시된 결과를 돌려줍니다.
-- `ai-compare`는 질문마다 실제 AI API를 호출하므로, 각 서비스(OpenAI/Google/Anthropic)의
-  자체 사용 요금이 발생합니다. 필요한 AI만 키를 등록해 비용을 조절할 수 있습니다.
+```text
+https://YOUR-PROJECT.vercel.app/api/workplace-population?year=2024
+```
 
-## 6. AI 모델명이 바뀌어 오류가 날 때
+정상이면 `FeatureCollection`과 `meta`가 나오며:
+- `meta.output_crs` = `EPSG:4326`
+- `meta.feature_count` > 0
 
-AI 제공사들은 모델을 자주 교체/종료합니다. "The model ... does not exist",
-"no longer available to new users" 같은 오류가 뜨면 `api/ai-compare.js`의 모델명만
-아래 위치에서 최신값으로 바꾸고 재배포하면 됩니다.
+이어야 합니다.
 
-- OpenAI: `model: 'gpt-4o-mini'` → https://platform.openai.com/docs/models
-- Gemini: URL 안의 `models/gemini-3.6-flash:generateContent` → https://ai.google.dev/gemini-api/docs/models
-- Groq: `model: 'openai/gpt-oss-20b'` → https://console.groq.com/docs/models (종료 목록: /docs/deprecations)
+### Drive가 여전히 안 될 때
+1. `GOOGLE_DRIVE_FOLDER_ID`가 `.`인지 확인 → 삭제하거나 실제 ID/URL로 변경
+2. 서비스 계정 이메일에 대상 폴더를 공유했는지 확인
+3. Google Cloud 프로젝트에서 **Google Drive API**를 사용 설정했는지 확인
+4. 환경변수 수정 후 Redeploy 했는지 확인
+5. `/api/health`에서 Drive 항목이 모두 true인지 확인
 
-## 7. "Incorrect API key" 오류
+### 뉴스가 여전히 안 될 때
+- `OPENAI_API_KEY` 잔액/사용한도 확인
+- `/api/health`에서 `ai.openai: true` 확인
+- 오류 메시지에 모델/툴 권한 문제가 나오면 `OPENAI_NEWS_MODEL`을 현재 웹검색 지원 모델로 변경 후 Redeploy
 
-이건 코드가 아니라 **키 값 자체가 잘못 등록된 것**입니다.
-- 해당 제공사 콘솔에서 키를 다시 복사 (앞뒤 공백/줄바꿈 없이 전체를)
-- Vercel → Environment Variables에서 해당 키를 삭제 후 다시 추가
-- **Redeploy** (재배포해야 반영됨)
-- 키 이름(Key 칸)에 값이 들어가지 않았는지, 값(Value 칸)에 이름이 들어가지 않았는지 확인
+---
 
-## 8. 자비스(3AI 비교)의 구글시트 상세분석
+## 5. 보안
 
-`context.apps_script_url`이 전달되면(대시보드가 자동으로 보냄), 서버가 대시보드와
-동일한 구글시트 데이터를 **직접 실시간 조회**해 GPT·Gemini에게는 거래금액 상위
-60건 전체(주소·용도·평단가·공시지가 대비율·스토리 요약 포함)를 컨텍스트로 줍니다.
-Groq는 무료 토큰 한도가 좁아 기존처럼 상위 12건 요약본만 사용합니다.
-
-시트 조회에 실패해도(네트워크 오류 등) 자비스 자체는 멈추지 않고, 조용히 요약본
-컨텍스트로 대체되어 답변합니다.
-
-## 9. 📰 뉴스 검색 (dealbook.co.kr · thebell.co.kr)
-
-OpenAI의 Responses API 내장 `web_search` 도구 + `allowed_domains` 필터를 사용해,
-**딜북(dealbook.co.kr)과 더벨(thebell.co.kr) 두 사이트 안에서만** 실제로 검색합니다.
-"자비스"(폐쇄형 분석)와 달리 이 모드는 일부러 인터넷을 검색하며, `OPENAI_API_KEY`만
-있으면 별도 설정 없이 바로 동작합니다.
-
-- 검색 대상 도메인은 `api/ai-compare.js`의 `NEWS_DOMAINS` 배열에서 바꿀 수 있습니다.
-- 답변 끝에 참고한 기사 제목과 링크가 자동으로 붙습니다.
-- 두 사이트에 관련 기사가 없으면 "관련 기사를 찾지 못했습니다"라고 정직하게 답하도록
-  지시해뒀습니다.
-- 이 기능은 `web_search` 도구를 지원하는 계정/모델에서만 동작합니다. "invalid tool"류
-  오류가 나면 OpenAI 계정에서 Responses API·웹서치 도구 사용 가능 여부를 확인하세요.
-
-## 10. 📁 구글드라이브 연동 (서비스 계정 방식)
-
-박사님이 로그인/동의하는 절차 없이, **서비스 계정에 폴더를 "공유"** 해두는 것만으로
-서버가 조용히 접근합니다. 설정은 최초 1회만 하면 됩니다.
-
-### 설정 절차 (약 10분)
-
-1. **Google Cloud Console** (console.cloud.google.com) 접속 → 프로젝트 선택(또는 새로 생성)
-2. 좌측 메뉴 **API 및 서비스 → 라이브러리** → "Google Drive API" 검색 → **사용 설정**
-3. **API 및 서비스 → 사용자 인증 정보** → **사용자 인증 정보 만들기 → 서비스 계정**
-   - 이름은 아무거나(예: `bskit-drive-reader`) → 만들고 계속하기 → 완료
-4. 방금 만든 서비스 계정 클릭 → **키** 탭 → **키 추가 → 새 키 만들기 → JSON** → 다운로드
-   - 다운로드된 JSON 파일 안에 `client_email`과 `private_key` 값이 있습니다
-5. 다운로드된 JSON에서 `client_email` 값(예: `bskit-drive-reader@프로젝트명.iam.gserviceaccount.com`)을 복사
-6. **Google Drive**로 이동 → AI가 참고했으면 하는 폴더(예: "BSKIT 자료") 우클릭 → **공유**
-   → 5번에서 복사한 서비스 계정 이메일을 추가, 권한은 **뷰어**로 충분
-7. 그 폴더를 열어 주소창 URL의 마지막 부분(`/folders/` 뒤의 문자열)이 **폴더 ID**입니다
-
-### Vercel 환경변수 등록
-
-| 변수명 | 값 |
-|---|---|
-| `GOOGLE_SERVICE_ACCOUNT_EMAIL` | JSON의 `client_email` |
-| `GOOGLE_SERVICE_ACCOUNT_KEY` | JSON의 `private_key` (`-----BEGIN PRIVATE KEY-----`부터 끝까지 전체를 그대로 붙여넣기) |
-| `GOOGLE_DRIVE_FOLDER_ID` (선택) | 6~7번에서 확인한 폴더 ID. 비우면 서비스 계정에 공유된 모든 파일에서 검색 |
-
-등록 후 **Redeploy** 필수입니다.
-
-### 지원 파일 형식
-
-- **Google 문서·스프레드시트·프레젠테이션**: 자동으로 텍스트를 추출해 AI가 읽습니다
-- **일반 텍스트(.txt) 파일**: 그대로 읽습니다
-- **PDF·Word·이미지 등**: 이 경량 서버에서는 내용을 추출하지 못해 파일명과 링크만 답변에 표시됩니다. (필요하시면 PDF 텍스트 추출 기능도 추가해 드릴 수 있습니다 — 말씀해 주세요)
-
-### 참고
-
-- 서비스 계정에 공유하지 않은 파일은 절대 접근되지 않습니다 — 폴더 단위로 명시적으로 공유한 것만 검색 대상입니다.
-- "관련 파일을 찾지 못했습니다"가 계속 뜨면, 폴더 공유가 제대로 됐는지·`GOOGLE_DRIVE_FOLDER_ID`가 정확한지 먼저 확인하세요.
+- API 키, SGIS 보안 Key, Google 서비스 계정 private key는 HTML/티스토리/GitHub 공개 저장소에 넣지 않습니다.
+- `api/health`는 값 자체가 아니라 설정 유무만 반환합니다.
+- Google Drive 서비스 계정에는 필요한 폴더만 뷰어로 공유하는 것을 권장합니다.
