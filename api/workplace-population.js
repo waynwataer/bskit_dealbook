@@ -64,10 +64,16 @@ module.exports = async function handler(req, res) {
 }
 
 async function sgisAuth(key, secret) {
-  var url = 'https://sgisapi.mods.go.kr/OpenAPI3/auth/authentication.json?consumer_key=' + encodeURIComponent(key) + '&consumer_secret=' + encodeURIComponent(secret);
+  var domain = 'sgisapi.mods.go.kr';
+  var url = 'https://' + domain + '/OpenAPI3/auth/authentication.json?consumer_key=' + encodeURIComponent(key) + '&consumer_secret=' + encodeURIComponent(secret);
   var r = await fetch(url);
   var j = await r.json();
-  if (!j || !j.result || !j.result.accessToken) throw new Error((j && j.errMsg) || 'SGIS 인증 실패');
+  if (!j || !j.result || !j.result.accessToken) {
+    var masked = key ? (key.length > 6 ? key.slice(0, 3) + '…' + key.slice(-3) : '(짧음)') : '(비어있음)';
+    var errMsg = (j && j.errMsg) || 'SGIS 인증 실패';
+    var errCd = (j && j.errCd !== undefined) ? j.errCd : '?';
+    throw new Error(errMsg + ' [domain=' + domain + ', errCd=' + errCd + ', key=' + masked + ']');
+  }
   return j.result.accessToken;
 }
 

@@ -48,6 +48,20 @@ module.exports = async function handler(req, res) {
   }
 
   try {
+    if (mode === 'news') {
+      // ★ 뉴스 검색은 "자비스"(폐쇄형 분석)와 완전히 다른 목적이라 sysLight/sysFull을
+      // 쓰지 않고, 지정된 두 언론사 도메인 안에서만 실제로 검색하도록 별도 경로로 처리합니다.
+      const result = await callOpenAINews(question, context);
+      res.status(200).json({ mode: 'news', result });
+      return;
+    }
+    if (mode === 'drive') {
+      // ★ 구글드라이브도 "자비스"와 별개 경로. 서비스 계정으로 공유된 폴더/파일만
+      // 조회하며, 그 안의 실제 파일 내용에서만 답을 찾습니다.
+      const result = await callGoogleDrive(question, context);
+      res.status(200).json({ mode: 'drive', result });
+      return;
+    }
     if (mode === 'compare') {
       const [openai, gemini, groq] = await Promise.all([callOpenAI(sysFull, askedQuestion), callGemini(sysFull, askedQuestion), callGroq(sysLight, askedQuestion)]);
       let consensus = { ok: false, error: '종합판정을 생성하지 못했습니다.' };
@@ -115,7 +129,7 @@ async function fetchSheetDeals(appsScriptUrl) {
         built_year: num(row[SHEET_COL.year]),
         close_date: String(row[SHEET_COL.date] || ''),
         tags: String(row[SHEET_COL.tags] || ''),
-        story_summary: story.slice(0, 150)
+        story_summary: story.slice(0, 400)
       };
     }).filter(function (d) { return d.name; });
     // 전체를 다 보내면 토큰이 과도해질 수 있어, 거래금액 상위 60건으로 캡핑
@@ -142,12 +156,22 @@ function buildSystemPrompt(context) {
     '당신이 답변에서 언급할 수 있는 건물명·매물명은 오직 다음 목록뿐입니다: [' +
     allNames.join(', ') + ']. 이 목록에 없는 건물명·회사명·금액·뉴스는 단 하나도 등장시키지 ' +
     '마세요. 목록 안에서 조건에 맞는 항목을 찾지 못하면 반드시 "제공된 데이터에는 해당 조건에 ' +
-    '맞는 거래사례가 없습니다"라고 명확히 답하고, 절대로 목록 밖의 사례로 대신 채우지 마세요. ' +
+    '맞는 거래사례가 없습니다"라고 명확히 밝히되, 거기서 답을 끝내지 말고 가진 데이터 안에서 ' +
+    '사용자에게 도움이 될 인접 정보를 이어서 제시하세요. 예를 들어 특정 용도(데이터센터 등) ' +
+    '거래가 없으면, 데이터에 있는 용도 구성이 무엇인지·가장 가까운 성격의 거래사례가 무엇인지· ' +
+    '전체 시장에서 어떤 특징이 관찰되는지를 구체적 수치와 함께 요약해 주세요. ' +
     '숫자를 인용할 때는 반드시 컨텍스트의 값을 그대로 사용하세요. ' +
     '사용자가 금액·면적 등 특정 조건(예: "500억 미만", "1000평 이상")으로 거래사례를 골라달라고 ' +
     '요청하면, 목록에 넣기 전에 각 항목의 해당 숫자 필드가 그 조건을 실제로 만족하는지 하나씩 ' +
     '반드시 검산하세요. 조건에 맞지 않는 항목은 절대 포함하지 말고, 목록 작성 후에도 한 번 더 ' +
     '전체 항목이 조건을 만족하는지 확인한 다음 답하세요. ' +
+    '거래 배경·임대조건·공실률·매수/매도 주체의 의도 같은 정성적 서술은 반드시 각 거래사례의 ' +
+    'story_summary 필드에 실제로 적힌 내용에서만 가져오세요. story_summary가 비어있거나 관련 ' +
+    '언급이 없으면 그 부분은 지어내지 말고 "스토리 정보 없음"이라고 밝히세요. ' +
+    '답변 품질: 뻔한 일반론(예: "시장 유동성을 높인다", "투자자 관심을 유도할 수 있다" 같은 ' +
+    '근거 없는 상투어)으로 채우지 말고, 컨텍스트의 구체적 수치(거래금액, 평단가, 공시지가 ' +
+    '대비율, 준공년도)를 직접 인용해 왜 그런 결론인지 논리를 보여주세요. 비교 가능한 다른 ' +
+    '거래사례가 컨텍스트에 있다면 반드시 함께 인용해 비교하세요. ' +
     '답변 형식: 마크다운 표(|---|---|)나 HTML 태그(<br> 등)는 절대 쓰지 마세요. 이 화면은 ' +
     '일반 텍스트만 표시하므로, 목록은 "- " 글머리 기호와 줄바꿈만 사용해 간결하게 정리하고, ' +
     '강조하고 싶은 부분만 **굵게**로 표시하세요.\n\n' +
@@ -243,5 +267,211 @@ async function callGroq(sys, question) {
     return { ok: true, text: text, model: 'gpt-oss-20b (Groq)' };
   } catch (e) {
     return { ok: false, error: e.message, model: 'groq' };
+  }
+}
+
+// ── 뉴스 검색: OpenAI Responses API의 내장 web_search 도구 +
+//    allowed_domains 필터로 dealbook.co.kr · thebell.co.kr 두 곳만 검색합니다.
+//    "자비스"(폐쇄형 분석)와 달리 이 모드는 일부러 외부 인터넷을 봅니다.
+var NEWS_DOMAINS = ['dealbook.co.kr', 'thebell.co.kr'];
+async function callOpenAINews(question, context) {
+  var key = (process.env.OPENAI_API_KEY || '').trim();
+  if (!key) return { ok: false, error: 'OPENAI_API_KEY가 서버에 설정되지 않았습니다.', model: 'news' };
+  try {
+    var selected = context && context.selected_deal;
+    var hint = selected && selected.name
+      ? ('참고로 사용자가 대시보드에서 보고 있는 거래사례는 "' + selected.name + '"' +
+         (selected.address ? ' (' + selected.address + ')' : '') + '입니다. 관련이 있다면 검색어에 참고하세요.\n\n')
+      : '';
+    var newsSys =
+      '당신은 한국 상업용 부동산·M&A 전문 뉴스 리서치 어시스턴트입니다. ' +
+      '반드시 검색 도구로 찾은 dealbook.co.kr, thebell.co.kr 두 사이트의 실제 기사 내용만 ' +
+      '근거로 답하세요. 검색 결과에 없는 내용은 추측하지 말고 "관련 기사를 찾지 못했습니다"라고 ' +
+      '답하세요. 답변 끝에는 참고한 기사 제목과 링크를 목록으로 정리하세요. 마크다운 표나 ' +
+      'HTML 태그는 쓰지 말고 "- " 글머리 기호만 사용하세요.';
+
+    var r = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        input: [
+          { role: 'system', content: newsSys },
+          { role: 'user', content: hint + question }
+        ],
+        tools: [{ type: 'web_search', filters: { allowed_domains: NEWS_DOMAINS } }],
+        tool_choice: 'required',
+        max_output_tokens: 1500
+      })
+    });
+    var j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+
+    var text = j.output_text || '';
+    var sources = [];
+    var didSearch = false;
+    (j.output || []).forEach(function (item) {
+      if (item && (item.type === 'web_search_call' || item.type === 'web_search')) didSearch = true;
+      (item && item.content || []).forEach(function (c) {
+        if (c && c.text && !text) text += c.text;
+        (c && c.annotations || []).forEach(function (a) {
+          if (a && a.url) sources.push({ url: a.url, title: a.title || a.url });
+        });
+      });
+    });
+    if (!text) {
+      text = didSearch
+        ? '(딜북·더벨에서 검색은 했지만 관련 기사를 찾지 못했습니다.)'
+        : '(웹 검색이 실행되지 않았습니다. OpenAI 계정에서 web_search 도구 사용이 제한되었을 수 있습니다.)';
+    }
+    if (sources.length) {
+      var seen = {};
+      var lines = sources.filter(function (s) { if (seen[s.url]) return false; seen[s.url] = 1; return true; })
+        .slice(0, 6)
+        .map(function (s) { return '- ' + s.title + ' — ' + s.url; });
+      text += '\n\n[참고 기사]\n' + lines.join('\n');
+    }
+    return { ok: true, text: text, model: 'gpt-4o-mini + web_search' + (didSearch ? ' ✓검색함' : ' ✗검색안함') };
+  } catch (e) {
+    return { ok: false, error: e.message, model: 'news' };
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+// 구글 드라이브 연동 — 서비스 계정(Service Account) 방식
+// 사용자가 매번 로그인/동의하는 OAuth 대신, "이 서비스 계정 이메일에게
+// 폴더를 공유"만 해두면 서버가 조용히 접근합니다(1회 설정).
+// 필요한 환경변수:
+//   GOOGLE_SERVICE_ACCOUNT_EMAIL   서비스 계정 이메일 (xxx@xxx.iam.gserviceaccount.com)
+//   GOOGLE_SERVICE_ACCOUNT_KEY     서비스 계정 비공개 키(PEM, JSON 키 파일의 private_key 값)
+//   GOOGLE_DRIVE_FOLDER_ID         (선택) 검색을 제한할 폴더 ID. 비우면 공유된 전체 파일 검색
+// ══════════════════════════════════════════════════════════
+var _driveToken = null, _driveTokenExp = 0;
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function driveAuth() {
+  var email = (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || '').trim();
+  // Vercel 환경변수에 여러 줄 PEM 키를 붙여넣으면 개행이 리터럴 "\n" 문자열로
+  // 저장되는 경우가 많아, 실제 개행 문자로 되돌려줍니다.
+  var pkey = (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').trim().replace(/\\n/g, '\n');
+  if (!email || !pkey) return Promise.reject(new Error('GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_SERVICE_ACCOUNT_KEY가 서버에 설정되지 않았습니다.'));
+  if (_driveToken && Date.now() < _driveTokenExp) return Promise.resolve(_driveToken);
+
+  var crypto = require('crypto');
+  var now = Math.floor(Date.now() / 1000);
+  var header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  var claim = base64url(JSON.stringify({
+    iss: email,
+    scope: 'https://www.googleapis.com/auth/drive.readonly',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  }));
+  var unsigned = header + '.' + claim;
+  var signer = crypto.createSign('RSA-SHA256');
+  signer.update(unsigned);
+  var signature;
+  try {
+    signature = signer.sign(pkey, 'base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  } catch (e) {
+    return Promise.reject(new Error('서비스 계정 비공개 키 형식이 올바르지 않습니다: ' + e.message));
+  }
+  var jwt = unsigned + '.' + signature;
+
+  return fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + jwt
+  }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res2) {
+      if (!res2.ok || !res2.j.access_token) throw new Error((res2.j && res2.j.error_description) || (res2.j && res2.j.error) || 'Drive 인증 실패');
+      _driveToken = res2.j.access_token;
+      _driveTokenExp = Date.now() + (Number(res2.j.expires_in || 3500) - 60) * 1000;
+      return _driveToken;
+    });
+}
+
+function driveSearchFiles(token, query) {
+  var folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+  var terms = String(query || '').split(/\s+/).filter(function (t) { return t && t.length >= 2; }).slice(0, 5);
+  var qParts = terms.map(function (t) { return "fullText contains '" + t.replace(/'/g, "\\'") + "'"; });
+  var q = qParts.length ? '(' + qParts.join(' or ') + ')' : "mimeType != 'application/vnd.google-apps.folder'";
+  q += " and trashed = false";
+  if (folderId) q += " and '" + folderId + "' in parents";
+  var url = 'https://www.googleapis.com/drive/v3/files?' +
+    'q=' + encodeURIComponent(q) +
+    '&fields=' + encodeURIComponent('files(id,name,mimeType,webViewLink,modifiedTime)') +
+    '&pageSize=8&orderBy=modifiedTime desc';
+  return fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res2) {
+      if (!res2.ok) throw new Error((res2.j && res2.j.error && res2.j.error.message) || 'Drive 검색 실패');
+      return (res2.j && res2.j.files) || [];
+    });
+}
+
+var DRIVE_EXPORTABLE = {
+  'application/vnd.google-apps.document': 'text/plain',
+  'application/vnd.google-apps.spreadsheet': 'text/csv',
+  'application/vnd.google-apps.presentation': 'text/plain'
+};
+function driveFetchFileText(token, file) {
+  var exportMime = DRIVE_EXPORTABLE[file.mimeType];
+  var url = exportMime
+    ? 'https://www.googleapis.com/drive/v3/files/' + file.id + '/export?mimeType=' + encodeURIComponent(exportMime)
+    : (file.mimeType === 'text/plain' || file.mimeType === 'text/csv')
+      ? 'https://www.googleapis.com/drive/v3/files/' + file.id + '?alt=media'
+      : null;
+  if (!url) {
+    // PDF·이미지·워드 등은 이 경량 서버에서 텍스트 추출이 어려워, 파일명/링크만 제공합니다.
+    return Promise.resolve('(이 파일 형식은 내용 미리보기를 지원하지 않습니다 — 링크로 직접 확인해 주세요)');
+  }
+  return fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+    .then(function (r) { return r.ok ? r.text() : Promise.resolve(''); })
+    .catch(function () { return ''; });
+}
+
+async function callGoogleDrive(question, context) {
+  try {
+    var token = await driveAuth();
+    var files = await driveSearchFiles(token, question);
+    if (!files.length) {
+      return { ok: true, text: '연결된 구글드라이브 폴더에서 이 질문과 관련된 파일을 찾지 못했습니다.', model: 'Google Drive' };
+    }
+    var top = files.slice(0, 4);
+    var texts = await Promise.all(top.map(function (f) { return driveFetchFileText(token, f); }));
+    var docsBlock = top.map(function (f, i) {
+      return '[파일: ' + f.name + ']\n' + String(texts[i] || '').slice(0, 2500);
+    }).join('\n\n---\n\n');
+
+    var sys =
+      '당신은 BSKIT DealBook의 구글드라이브 문서 검색 어시스턴트입니다. ' +
+      '아래 [문서] 내용에서 확인되는 사실만 근거로 한국어로 답하고, 문서에 없는 내용은 ' +
+      '추측하지 말고 "문서에서 확인되지 않습니다"라고 밝히세요. 마크다운 표나 HTML 태그는 ' +
+      '쓰지 말고 "- " 글머리 기호만 사용하세요.\n\n[문서]\n' + docsBlock;
+
+    var key = (process.env.OPENAI_API_KEY || '').trim();
+    if (!key) return { ok: false, error: 'OPENAI_API_KEY가 서버에 설정되지 않았습니다.', model: 'drive' };
+    var r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: question }],
+        temperature: 0.2,
+        max_tokens: 900
+      })
+    });
+    var j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+    var text = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '(응답 없음)';
+    var linkLines = top.map(function (f) { return '- ' + f.name + ' — ' + (f.webViewLink || ''); });
+    text += '\n\n[참고 파일]\n' + linkLines.join('\n');
+    return { ok: true, text: text, model: 'gpt-4o-mini + Google Drive(' + top.length + '개 파일)' };
+  } catch (e) {
+    return { ok: false, error: e.message, model: 'drive' };
   }
 }
