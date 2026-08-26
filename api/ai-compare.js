@@ -11,8 +11,18 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
-  if (req.method !== 'POST') { res.status(405).json({ error: 'POST 요청만 허용됩니다.' }); return; }
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method === 'GET') {
+    res.status(200).json({
+      ok: true, service: 'bskit-ai-compare', version: '13.8',
+      aiConfigured: !!((process.env.OPENAI_API_KEY||'').trim() || (process.env.GEMINI_API_KEY||'').trim() || (process.env.GROQ_API_KEY||'').trim()),
+      openaiConfigured: !!(process.env.OPENAI_API_KEY||'').trim(),
+      geminiConfigured: !!(process.env.GEMINI_API_KEY||'').trim(),
+      groqConfigured: !!(process.env.GROQ_API_KEY||'').trim(),
+      driveConfigured: !!((process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL||'').trim() && (process.env.GOOGLE_SERVICE_ACCOUNT_KEY||'').trim())
+    }); return;
+  }
+  if (req.method !== 'POST') { res.status(405).json({ error: 'GET/POST/OPTIONS만 허용됩니다.' }); return; }
 
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
@@ -161,6 +171,13 @@ function buildSystemPrompt(context) {
   var listingNames = listingsArr.map(function (s) { return s && s.name; }).filter(Boolean);
   var allNames = names.concat(listingNames);
   var sel = ctxObj.selected_deal;
+  var wp = ctxObj.selected_workplace_area;
+  var workplaceLine = (wp && wp.name)
+    ? ('■ 현재 지도에서 선택한 SGIS 직장인구 분석 대상은 "' + wp.name + '"입니다. ' +
+       '직장인구 질문에는 workers, rank, total_dongs, top_percent, vs_seoul_average, density_grade 값을 우선 사용하세요. ' +
+       '이 데이터는 종사자수이지 유동인구·주거인구·매출이 아니므로 서로 혼동하거나 없는 값을 추정하지 마세요. ' +
+       '해석은 업무집적도와 상업·오피스 입지의 시사점, 그리고 한계를 구분해 제시하세요. ')
+    : '';
   var focusLine = (sel && sel.name)
     ? ('■ 현재 사용자가 대시보드에서 선택한 분석 대상은 "' + sel.name + '"' +
        (sel.address ? ' (' + sel.address + ')' : '') + ' 입니다. 질문에 특정 건물이 명시되지 ' +
@@ -168,7 +185,7 @@ function buildSystemPrompt(context) {
     : '';
   var ctx = JSON.stringify(ctxObj).slice(0, 9000);
   return (
-    focusLine +
+    workplaceLine + focusLine +
     '당신은 BSKIT DealBook 대시보드 전용 "폐쇄형(closed-book)" 분석 어시스턴트입니다. ' +
     '반드시 아래 JSON 컨텍스트 안의 데이터만 사용해 답하고, 당신이 사전에 학습한 실제 서울 ' +
     '부동산 시장 지식(뉴스로 알려진 매각 사례, 유명 빌딩 거래가 등)은 이 답변에 절대 끌어오지 ' +
@@ -226,33 +243,75 @@ async function callOpenAI(sys, question, isSummary) {
 }
 
 async function callGemini(sys, question) {
-  var key = (process.env.GEMINI_API_KEY||"").trim();
+  var key = (process.env.GEMINI_API_KEY || '').trim();
   if (!key) return { ok: false, error: 'GEMINI_API_KEY가 서버에 설정되지 않았습니다.', model: 'gemini' };
+
+  // v13.8 — Gemini 안정화
+  // 2.5 Flash는 더 이상 fallback으로 사용하지 않습니다. 현재 GA Flash 계열을
+  // 3.7 -> 3.6 -> 3.5 순으로 재시도하고, 무료 티어에서 과도한 추론 토큰을
+  // 쓰지 않도록 기본 thinkingLevel은 medium으로 둡니다.
+  var geminiSystem = sys + '\n\n' +
+    '■ Gemini 전용 부동산 분석 규칙\n' +
+    '- 반드시 한국어로 답하세요.\n' +
+    '- 짧은 요약으로 끝내지 말고, 결론의 근거가 되는 실제 수치를 직접 인용하세요.\n' +
+    '- 거래사례/매물 분석이면 가능한 범위에서 거래금액, 연면적, 대지면적, 평단가, 공시지가 대비율, 준공연도 중 최소 4개 이상을 사용하세요.\n' +
+    '- 비교 가능한 사례가 있으면 최소 2건을 골라 동일 지표로 비교하고, 왜 비교대상인지 한 줄로 설명하세요.\n' +
+    '- 프리미엄/디스카운트 질문은 ① 수치상 위치 ② 가격상승 요인 ③ 가격하락 요인 ④ 추가 확인사항 ⑤ 최종 판단 순으로 답하세요.\n' +
+    '- SGIS 직장인구 질문은 ① 종사자수 ② 서울 순위/상위비율 ③ 서울 평균 대비 배수 ④ 업무집적도 ⑤ 상업·오피스 입지 시사점 ⑥ 데이터 한계 순으로 답하세요.\n' +
+    '- 컨텍스트에 없는 수치는 추정하지 말고 "제공 데이터 없음"이라고 쓰세요.\n' +
+    '- 마지막은 반드시 "최종 판단:"으로 정리하세요.';
+
+  var configured = (process.env.GEMINI_MODEL || '').trim();
+  var models = [];
+  [configured, 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'].forEach(function(m){
+    if (m && models.indexOf(m) < 0) models.push(m);
+  });
+  var errors = [];
+  for (var i = 0; i < models.length; i++) {
+    var model = models[i];
+    try {
+      var result = await callGeminiModel(model, key, geminiSystem, question);
+      return result;
+    } catch (e) {
+      errors.push(model + ': ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+  return { ok: false, error: 'Gemini 호출 실패 — ' + errors.join(' | '), model: 'gemini' };
+}
+
+async function callGeminiModel(model, key, sys, question) {
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
+  var level = (process.env.GEMINI_THINKING_LEVEL || 'medium').trim().toLowerCase();
+  if (['minimal','low','medium','high'].indexOf(level) < 0) level = 'medium';
+  var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = controller ? setTimeout(function(){ controller.abort(); }, 45000) : null;
   try {
-    // 무료 티어에서 신규 사용자에게 열려 있는 최신 Flash 모델로 지정합니다.
-    // (2.5-flash는 신규 사용자 제한 → 구글 안내에 따라 3.6-flash 사용)
-    var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=' + key;
-    // gemini-3.6-flash는 기본적으로 "내부 추론(thinking)"에 답변 토큰 예산을
-    // 먼저 소모합니다. thinkingConfig(thinkingBudget:0) 옵션이 이 모델에서
-    // "invalid argument"로 거부되어 아예 실패했던 적이 있어, 옵션은 빼고
-    // 상한만 넉넉히(2000) 올려 추론 후에도 답변 쓸 공간을 확보합니다.
     var r = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      signal: controller ? controller.signal : undefined,
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: sys + '\n\n질문: ' + question }] }],
-        generationConfig: { maxOutputTokens: 2000 }
+        system_instruction: { parts: [{ text: sys }] },
+        contents: [{ role: 'user', parts: [{ text: question }] }],
+        generationConfig: {
+          maxOutputTokens: 4096,
+          thinkingConfig: { thinkingLevel: level }
+        }
       })
     });
-    var j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
-    var cand = (j.candidates && j.candidates[0]) || {};
+    var raw = await r.text();
+    var j = null; try { j = JSON.parse(raw); } catch (_) {}
+    if (!r.ok) {
+      var msg = (j && j.error && j.error.message) || raw.slice(0, 300) || ('HTTP ' + r.status);
+      throw new Error('HTTP ' + r.status + ' · ' + msg);
+    }
+    var cand = (j && j.candidates && j.candidates[0]) || {};
     var parts = (cand.content && cand.content.parts) || [];
-    var text = parts.map(function (p) { return p.text || ''; }).join('');
-    if (!text) text = '(응답 없음' + (cand.finishReason ? ' · 종료사유: ' + cand.finishReason : '') + ')';
-    return { ok: true, text: text, model: 'gemini-3.6-flash' };
-  } catch (e) {
-    return { ok: false, error: e.message, model: 'gemini' };
+    var text = parts.map(function(p){ return p && p.text ? p.text : ''; }).join('').trim();
+    if (!text) throw new Error('빈 응답' + (cand.finishReason ? ' · 종료사유=' + cand.finishReason : ''));
+    return { ok: true, text: text, model: model + ' · ' + level + ' reasoning' };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

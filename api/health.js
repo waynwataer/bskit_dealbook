@@ -15,7 +15,7 @@ module.exports = async function handler(req, res) {
   res.status(200).json({
     ok: true,
     service: 'bskit-dealbook',
-    version: '13.7',
+    version: '13.8',
     aiConfigured: hasOpenAI || hasGemini || hasGroq,
     openaiConfigured: hasOpenAI,
     geminiConfigured: hasGemini,
@@ -23,6 +23,8 @@ module.exports = async function handler(req, res) {
     driveConfigured: hasDrive,
     sgisConfigured: hasSgis,
     sgisYear: (process.env.SGIS_STATS_YEAR || '2024').trim(),
-    workplaceOutputCrs: 'EPSG:4326'
+    workplaceOutputCrs: 'EPSG:4326',
+    geminiPrimaryModel: (process.env.GEMINI_MODEL || 'gemini-3.7-flash').trim(),
+    geminiThinkingLevel: (process.env.GEMINI_THINKING_LEVEL || 'medium').trim()
   });
 };
