@@ -15,7 +15,7 @@ module.exports = async function handler(req, res) {
   res.status(200).json({
     ok: true,
     service: 'bskit-dealbook',
-    version: '13.6',
+    version: '13.7',
     aiConfigured: hasOpenAI || hasGemini || hasGroq,
     openaiConfigured: hasOpenAI,
     geminiConfigured: hasGemini,

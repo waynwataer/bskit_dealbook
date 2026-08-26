@@ -13,3 +13,10 @@ SGIS 행정동 경계는 EPSG:5179 좌표를 반환할 수 있으므로 서버�
 `package.json`의 `proj4` dependency가 반드시 함께 배포되어야 합니다.
 
 배포 후 `/api/workplace-population?year=2024`에서 `meta.output_crs`가 `EPSG:4326`인지 확인하세요.
+
+
+## v13.7 Gemini 분석 품질 강화
+- Gemini 3.6 Flash에 `system_instruction`을 별도로 전달합니다.
+- `thinkingLevel: high`와 최대 출력 4096 tokens를 사용합니다.
+- 거래/매물 분석 시 최소 4개 핵심 수치, 2개 이상 비교사례, 프리미엄/디스카운트 요인, 최종 판단을 요구합니다.
+- 3.6 Flash 호출 실패 시 2.5 Flash로 자동 fallback합니다.
