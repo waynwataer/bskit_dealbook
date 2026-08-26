@@ -1,9 +1,8 @@
 {
   "name": "bskit-dealbook-backend",
-  "version": "1.0.0",
+  "version": "1.3.6",
   "private": true,
-  "description": "BSKIT DealBook용 백엔드 — 3AI 비교 분석 + 직장인구(SGIS) 프록시",
-  "scripts": {
-    "dev": "vercel dev"
-  }
+  "description": "BSKIT DealBook backend — 3AI, news, Google Drive, SGIS workplace population proxy",
+  "scripts": {"dev":"vercel dev"},
+  "dependencies": {"proj4":"^2.19.10"}
 }

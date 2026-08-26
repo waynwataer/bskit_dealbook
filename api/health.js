@@ -15,12 +15,14 @@ module.exports = async function handler(req, res) {
   res.status(200).json({
     ok: true,
     service: 'bskit-dealbook',
-    version: '13.5',
+    version: '13.6',
     aiConfigured: hasOpenAI || hasGemini || hasGroq,
     openaiConfigured: hasOpenAI,
     geminiConfigured: hasGemini,
     groqConfigured: hasGroq,
     driveConfigured: hasDrive,
-    sgisConfigured: hasSgis
+    sgisConfigured: hasSgis,
+    sgisYear: (process.env.SGIS_STATS_YEAR || '2024').trim(),
+    workplaceOutputCrs: 'EPSG:4326'
   });
 };

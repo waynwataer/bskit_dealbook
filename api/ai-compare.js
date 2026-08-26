@@ -171,6 +171,13 @@ function buildSystemPrompt(context) {
   var listingNames = listingsArr.map(function (s) { return s && s.name; }).filter(Boolean);
   var allNames = names.concat(listingNames);
   var sel = ctxObj.selected_deal;
+  var wp = ctxObj.selected_workplace_area;
+  var workplaceLine = (wp && wp.name)
+    ? ('■ 현재 지도에서 선택한 SGIS 직장인구 분석 대상은 "' + wp.name + '"입니다. ' +
+       '직장인구 질문에는 workers, rank, total_dongs, top_percent, vs_seoul_average, density_grade 값을 우선 사용하세요. ' +
+       '이 데이터는 종사자수이지 유동인구·주거인구·매출이 아니므로 서로 혼동하거나 없는 값을 추정하지 마세요. ' +
+       '해석은 업무집적도와 상업·오피스 입지의 시사점, 그리고 한계를 구분해 제시하세요. ')
+    : '';
   var focusLine = (sel && sel.name)
     ? ('■ 현재 사용자가 대시보드에서 선택한 분석 대상은 "' + sel.name + '"' +
        (sel.address ? ' (' + sel.address + ')' : '') + ' 입니다. 질문에 특정 건물이 명시되지 ' +
@@ -178,7 +185,7 @@ function buildSystemPrompt(context) {
     : '';
   var ctx = JSON.stringify(ctxObj).slice(0, 9000);
   return (
-    focusLine +
+    workplaceLine + focusLine +
     '당신은 BSKIT DealBook 대시보드 전용 "폐쇄형(closed-book)" 분석 어시스턴트입니다. ' +
     '반드시 아래 JSON 컨텍스트 안의 데이터만 사용해 답하고, 당신이 사전에 학습한 실제 서울 ' +
     '부동산 시장 지식(뉴스로 알려진 매각 사례, 유명 빌딩 거래가 등)은 이 답변에 절대 끌어오지 ' +
