@@ -20,9 +20,22 @@ module.exports = async function handler(req, res) {
 
   if (!question.trim()) { res.status(400).json({ error: 'question(질문)이 비어 있습니다.' }); return; }
 
+  // ★ 선택된 거래사례가 있으면, 질문 맨 앞에 "분석 대상"으로 못박아 모델이 다른
+  // 거래사례로 새지 않도록 합니다. (예: 광화문G스퀘어를 물었는데 G1서울을 분석하는 문제 방지)
+  var sel0 = context && context.selected_deal;
+  var focusLine = '';
+  if (sel0 && sel0.name) {
+    focusLine =
+      '★ 지금 분석 대상은 오직 "' + sel0.name + '"' + (sel0.address ? ' (' + sel0.address + ')' : '') +
+      ' 한 건입니다. 질문이 이 거래사례를 가리키므로, 이 건물을 중심으로 답하세요. ' +
+      '다른 거래사례(예: 목록 상위의 대형 거래)를 대신 분석하지 마세요. ' +
+      '비교가 필요할 때만 다른 사례를 보조로 인용하고, 주어는 항상 "' + sel0.name + '"여야 합니다.\n\n';
+  }
+
   // ★ 시스템 프롬프트뿐 아니라 사용자 질문 바로 앞에도 같은 지시를 한 번 더 붙입니다.
   // 모델이 대화의 뒷부분(최신 지시)을 더 강하게 따르는 경향이 있어, 이중 안전장치입니다.
   const askedQuestion =
+    focusLine +
     '(반드시 시스템 컨텍스트에 있는 거래사례만 사용해 답하세요. 목록에 없는 건물명이나 ' +
     '당신이 알고 있는 실제 뉴스 속 매각 사례는 절대 언급하지 마세요.)\n\n' + question;
 
@@ -147,8 +160,15 @@ function buildSystemPrompt(context) {
   var listingsArr = Array.isArray(ctxObj.sale_listings) ? ctxObj.sale_listings : [];
   var listingNames = listingsArr.map(function (s) { return s && s.name; }).filter(Boolean);
   var allNames = names.concat(listingNames);
+  var sel = ctxObj.selected_deal;
+  var focusLine = (sel && sel.name)
+    ? ('■ 현재 사용자가 대시보드에서 선택한 분석 대상은 "' + sel.name + '"' +
+       (sel.address ? ' (' + sel.address + ')' : '') + ' 입니다. 질문에 특정 건물이 명시되지 ' +
+       '않으면 이 거래사례를 대상으로 답하세요. 다른 건물을 주어로 삼지 마세요. ')
+    : '';
   var ctx = JSON.stringify(ctxObj).slice(0, 9000);
   return (
+    focusLine +
     '당신은 BSKIT DealBook 대시보드 전용 "폐쇄형(closed-book)" 분석 어시스턴트입니다. ' +
     '반드시 아래 JSON 컨텍스트 안의 데이터만 사용해 답하고, 당신이 사전에 학습한 실제 서울 ' +
     '부동산 시장 지식(뉴스로 알려진 매각 사례, 유명 빌딩 거래가 등)은 이 답변에 절대 끌어오지 ' +
@@ -394,11 +414,50 @@ function driveAuth() {
     });
 }
 
-function driveSearchFiles(token, query) {
+// 질문·거래사례에서 검색에 쓸 핵심 키워드를 뽑습니다. "분석","정리","의견" 같은
+// 명령/불용어는 제거해, 파일 매칭을 방해하지 않도록 합니다.
+var DRIVE_STOPWORDS = ['분석','정리','요약','해줘','해주세요','알려줘','관련','문서','자료','내용','최근','대해','대한','에서','전문가','의견','리포트','레포트','보고서','찾아','검색','있는','있나','대상','현재','선택','매매','사례','거래','매물','비교','포함','시장'];
+function driveKeywords(question, context) {
+  var terms = [];
+  var sel = context && context.selected_deal;
+  if (sel) {
+    // 거래사례명(핵심 명사)·주소의 동/구를 우선 검색어로 사용
+    if (sel.name) String(sel.name).split(/[\s()·,]+/).forEach(function (t) { if (t && t.length >= 2) terms.push(t); });
+    if (sel.address) {
+      var m = String(sel.address).match(/([가-힣]+동|[가-힣]+구|[가-힣0-9-]+가|[가-힣]+로)/g);
+      if (m) m.forEach(function (t) { terms.push(t); });
+    }
+  }
+  // 질문에서 불용어를 뺀 의미 있는 단어 보강
+  String(question || '').split(/[\s,()·.]+/).forEach(function (t) {
+    if (t && t.length >= 2 && DRIVE_STOPWORDS.indexOf(t) < 0 && terms.indexOf(t) < 0) terms.push(t);
+  });
+  // 중복 제거 + 상위 8개
+  var seen = {}, out = [];
+  terms.forEach(function (t) { var k = t.toLowerCase(); if (!seen[k]) { seen[k] = 1; out.push(t); } });
+  return out.slice(0, 8);
+}
+
+function driveListAll(token) {
   var folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
-  var terms = String(query || '').split(/\s+/).filter(function (t) { return t && t.length >= 2; }).slice(0, 6);
-  // 파일명 또는 본문에 검색어가 포함된 파일을 찾습니다(파일명 매칭도 함께).
-  var qParts = terms.map(function (t) {
+  var q = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
+  if (folderId) q += " and '" + folderId + "' in parents";
+  var url = 'https://www.googleapis.com/drive/v3/files?' +
+    'q=' + encodeURIComponent(q) +
+    '&fields=' + encodeURIComponent('files(id,name,mimeType,webViewLink,modifiedTime)') +
+    '&pageSize=50&orderBy=modifiedTime desc';
+  return fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res2) {
+      if (!res2.ok) throw new Error((res2.j && res2.j.error && res2.j.error.message) || 'Drive 목록 실패');
+      return (res2.j && res2.j.files) || [];
+    });
+}
+
+function driveSearchFiles(token, terms) {
+  var folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+  var use = (terms || []).slice(0, 6);
+  var qParts = use.map(function (t) {
     var esc = t.replace(/'/g, "\\'");
     return "(name contains '" + esc + "' or fullText contains '" + esc + "')";
   });
@@ -408,21 +467,72 @@ function driveSearchFiles(token, query) {
   var url = 'https://www.googleapis.com/drive/v3/files?' +
     'q=' + encodeURIComponent(q) +
     '&fields=' + encodeURIComponent('files(id,name,mimeType,webViewLink,modifiedTime)') +
-    '&pageSize=10&orderBy=modifiedTime desc';
+    '&pageSize=15&orderBy=modifiedTime desc';
   return fetch(url, { headers: { Authorization: 'Bearer ' + token } })
     .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
     .then(function (res2) {
       if (!res2.ok) throw new Error((res2.j && res2.j.error && res2.j.error.message) || 'Drive 검색 실패');
-      var files = (res2.j && res2.j.files) || [];
-      // 파일명에 검색어가 많이 겹치는 순으로 재정렬 → 사용자가 지목한 파일을 1순위로
-      var lowerTerms = terms.map(function (t) { return t.toLowerCase(); });
-      files.forEach(function (f) {
-        var nm = String(f.name || '').toLowerCase();
-        f._score = lowerTerms.reduce(function (s, t) { return s + (nm.indexOf(t) >= 0 ? 1 : 0); }, 0);
-      });
-      files.sort(function (a, b) { return (b._score || 0) - (a._score || 0); });
-      return files;
+      return (res2.j && res2.j.files) || [];
     });
+}
+
+// 파일명이 검색어와 얼마나 겹치는지 점수화(정밀 매칭 우선순위 결정용)
+function scoreByName(files, terms) {
+  var lower = (terms || []).map(function (t) { return t.toLowerCase(); });
+  files.forEach(function (f) {
+    var nm = String(f.name || '').toLowerCase();
+    f._score = lower.reduce(function (s, t) { return s + (nm.indexOf(t) >= 0 ? 1 : 0); }, 0);
+  });
+  files.sort(function (a, b) { return (b._score || 0) - (a._score || 0); });
+  return files;
+}
+
+// 후보가 많고 파일명 점수로 확실히 못 고를 때, LLM에게 파일명 목록만 주고 고르게 함
+async function drivePickFileByLLM(token, question, context, files) {
+  var key = (process.env.OPENAI_API_KEY || '').trim();
+  if (!key) return 0;
+  var sel = context && context.selected_deal;
+  var ctxLine = sel
+    ? ('선택된 거래사례: ' + (sel.name || '') + (sel.address ? ' / ' + sel.address : ''))
+    : '선택된 거래사례 없음';
+
+  // Google 문서·시트·txt는 본문 앞부분(스니펫)을 붙여 판단 정확도를 높입니다.
+  // (PDF는 여기서 본문 추출이 비싸 파일명만 사용 — fullText 검색으로 이미 후보에 든 상태)
+  var snippets = await Promise.all(files.map(function (f) {
+    var canText = !!DRIVE_EXPORTABLE[f.mimeType] || f.mimeType === 'text/plain' || f.mimeType === 'text/csv';
+    if (!canText) return Promise.resolve('');
+    return driveFetchFileText(token, f).then(function (t) {
+      return String(t || '').replace(/\s+/g, ' ').slice(0, 300);
+    }).catch(function () { return ''; });
+  }));
+
+  var list = files.map(function (f, i) {
+    return i + '. ' + f.name + (snippets[i] ? '\n   내용발췌: ' + snippets[i] : '');
+  }).join('\n');
+
+  try {
+    var r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{
+          role: 'system',
+          content: '아래 파일 목록(파일명과 일부 내용발췌)에서 사용자의 질문·선택된 거래사례에 ' +
+            '가장 관련 높은 파일 1개의 번호만 숫자로 답하세요. 파일명에 건물명이 없더라도 ' +
+            '내용발췌에 관련 내용이 있으면 그 파일을 고르세요. 관련된 파일이 하나도 없으면 -1만 ' +
+            '답하세요. 다른 말은 절대 하지 마세요.\n\n' +
+            ctxLine + '\n\n[파일 목록]\n' + list
+        }, { role: 'user', content: question }],
+        temperature: 0, max_tokens: 5
+      })
+    });
+    var j = await r.json();
+    var raw = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '0';
+    var idx = parseInt(String(raw).replace(/[^0-9-]/g, ''), 10);
+    if (isNaN(idx)) return 0;
+    return idx;
+  } catch (e) { return 0; }
 }
 
 var DRIVE_EXPORTABLE = {
@@ -492,12 +602,50 @@ async function analyzePdfWithGemini(question, file, base64Data, mimeType) {
 async function callGoogleDrive(question, context) {
   try {
     var token = await driveAuth();
-    var files = await driveSearchFiles(token, question);
-    if (!files.length) {
-      return { ok: true, text: '연결된 구글드라이브 폴더에서 이 질문과 관련된 파일을 찾지 못했습니다.', model: 'Google Drive' };
+
+    // 검색어를 "선택한 거래사례 + 질문 핵심어"에서 추출(명령어·불용어 제거)
+    var terms = driveKeywords(question, context);
+
+    // 1단계: 정밀 검색 — 파일명 OR 본문(fullText)에 건물명 키워드가 든 파일.
+    // Drive의 fullText는 PDF 내용까지 색인하므로, 파일명에 건물명이 없어도
+    // 본문에 건물명이 있으면 여기서 잡힙니다.
+    var files = terms.length ? await driveSearchFiles(token, terms) : [];
+    files = scoreByName(files, terms);
+
+    var picked = null;
+    if (files.length === 1) {
+      picked = files[0];
+    } else if (files.length > 1 && files[0]._score > 0 && files[0]._score > (files[1]._score || 0)) {
+      // 파일명 매칭이 명확히 1등이면 그대로 사용
+      picked = files[0];
+    } else if (files.length > 1) {
+      // 파일명만으로 못 고르면(본문으로만 매칭된 경우 포함) 스니펫 보고 LLM이 선택
+      var idxA = await drivePickFileByLLM(token, question, context, files.slice(0, 12));
+      picked = (idxA >= 0) ? files[idxA] : files[0];
     }
-    // ★ 가장 관련 높은 1개 파일만 분석 (안정성·비용 우선)
-    var file = files[0];
+
+    if (!picked) {
+      // 2단계: 검색으로 아무것도 못 찾으면 폴더 전체를 훑어 LLM이 관련 파일을 고름
+      var all = await driveListAll(token);
+      if (!all.length) {
+        return { ok: true, text: '연결된 구글드라이브 폴더에 분석할 파일이 없습니다. 폴더 공유와 GOOGLE_DRIVE_FOLDER_ID 설정을 확인해 주세요.', model: 'Google Drive' };
+      }
+      var candidates = all.slice(0, 25);
+      var idx = await drivePickFileByLLM(token, question, context, candidates);
+      if (idx < 0) {
+        var listLines = candidates.slice(0, 10).map(function (f) { return '- ' + f.name + ' — ' + (f.webViewLink || ''); });
+        return {
+          ok: true, model: 'Google Drive',
+          text: '질문·선택한 거래사례와 뚜렷하게 관련된 문서를 폴더에서 찾지 못했습니다. ' +
+            '폴더에 있는 문서 목록은 아래와 같습니다. 분석하고 싶은 문서명을 질문에 포함해 다시 요청해 주세요.\n\n' +
+            listLines.join('\n')
+        };
+      }
+      picked = candidates[idx] || candidates[0];
+      files = candidates;
+    }
+
+    var file = picked;
     var isGoogleDoc = !!DRIVE_EXPORTABLE[file.mimeType];
     var isPlainText = (file.mimeType === 'text/plain' || file.mimeType === 'text/csv');
     var isPdfOrImage = (file.mimeType === 'application/pdf' || /^image\//.test(file.mimeType || ''));
@@ -543,10 +691,10 @@ async function callGoogleDrive(question, context) {
       result = { ok: true, text: '이 파일 형식(' + (file.mimeType || '알수없음') + ')은 아직 자동 분석을 지원하지 않습니다. 아래 링크로 직접 확인해 주세요.\nPDF·이미지·Google 문서·스프레드시트는 분석 가능합니다.', model: 'Google Drive' };
     }
 
-    // 분석한 파일 + 나머지 후보를 참고 목록으로 함께 표시
-    var refLines = files.slice(0, 5).map(function (f, i) {
-      return '- ' + (i === 0 ? '★ ' : '') + f.name + ' — ' + (f.webViewLink || '');
-    });
+    // 분석한 파일을 맨 위(★)에, 그 외 후보를 이어서 표시
+    var others = files.filter(function (f) { return f.id !== file.id; }).slice(0, 4);
+    var refLines = ['- ★ ' + file.name + ' — ' + (file.webViewLink || '')]
+      .concat(others.map(function (f) { return '- ' + f.name + ' — ' + (f.webViewLink || ''); }));
     result.text = (result.text || '') + '\n\n[분석한 파일 ★ / 그 외 후보]\n' + refLines.join('\n');
     return result;
   } catch (e) {
