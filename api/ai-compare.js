@@ -11,8 +11,18 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
-  if (req.method !== 'POST') { res.status(405).json({ error: 'POST 요청만 허용됩니다.' }); return; }
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method === 'GET') {
+    res.status(200).json({
+      ok: true, service: 'bskit-ai-compare', version: '13.5',
+      aiConfigured: !!((process.env.OPENAI_API_KEY||'').trim() || (process.env.GEMINI_API_KEY||'').trim() || (process.env.GROQ_API_KEY||'').trim()),
+      openaiConfigured: !!(process.env.OPENAI_API_KEY||'').trim(),
+      geminiConfigured: !!(process.env.GEMINI_API_KEY||'').trim(),
+      groqConfigured: !!(process.env.GROQ_API_KEY||'').trim(),
+      driveConfigured: !!((process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL||'').trim() && (process.env.GOOGLE_SERVICE_ACCOUNT_KEY||'').trim())
+    }); return;
+  }
+  if (req.method !== 'POST') { res.status(405).json({ error: 'GET/POST/OPTIONS만 허용됩니다.' }); return; }
 
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
