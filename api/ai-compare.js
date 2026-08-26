@@ -11,18 +11,8 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
-  if (req.method === 'GET') {
-    res.status(200).json({
-      ok: true, service: 'bskit-ai-compare', version: '13.7',
-      aiConfigured: !!((process.env.OPENAI_API_KEY||'').trim() || (process.env.GEMINI_API_KEY||'').trim() || (process.env.GROQ_API_KEY||'').trim()),
-      openaiConfigured: !!(process.env.OPENAI_API_KEY||'').trim(),
-      geminiConfigured: !!(process.env.GEMINI_API_KEY||'').trim(),
-      groqConfigured: !!(process.env.GROQ_API_KEY||'').trim(),
-      driveConfigured: !!((process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL||'').trim() && (process.env.GOOGLE_SERVICE_ACCOUNT_KEY||'').trim())
-    }); return;
-  }
-  if (req.method !== 'POST') { res.status(405).json({ error: 'GET/POST/OPTIONS만 허용됩니다.' }); return; }
+  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
+  if (req.method !== 'POST') { res.status(405).json({ error: 'POST 요청만 허용됩니다.' }); return; }
 
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
@@ -171,13 +161,6 @@ function buildSystemPrompt(context) {
   var listingNames = listingsArr.map(function (s) { return s && s.name; }).filter(Boolean);
   var allNames = names.concat(listingNames);
   var sel = ctxObj.selected_deal;
-  var wp = ctxObj.selected_workplace_area;
-  var workplaceLine = (wp && wp.name)
-    ? ('■ 현재 지도에서 선택한 SGIS 직장인구 분석 대상은 "' + wp.name + '"입니다. ' +
-       '직장인구 질문에는 workers, rank, total_dongs, top_percent, vs_seoul_average, density_grade 값을 우선 사용하세요. ' +
-       '이 데이터는 종사자수이지 유동인구·주거인구·매출이 아니므로 서로 혼동하거나 없는 값을 추정하지 마세요. ' +
-       '해석은 업무집적도와 상업·오피스 입지의 시사점, 그리고 한계를 구분해 제시하세요. ')
-    : '';
   var focusLine = (sel && sel.name)
     ? ('■ 현재 사용자가 대시보드에서 선택한 분석 대상은 "' + sel.name + '"' +
        (sel.address ? ' (' + sel.address + ')' : '') + ' 입니다. 질문에 특정 건물이 명시되지 ' +
@@ -185,7 +168,7 @@ function buildSystemPrompt(context) {
     : '';
   var ctx = JSON.stringify(ctxObj).slice(0, 9000);
   return (
-    workplaceLine + focusLine +
+    focusLine +
     '당신은 BSKIT DealBook 대시보드 전용 "폐쇄형(closed-book)" 분석 어시스턴트입니다. ' +
     '반드시 아래 JSON 컨텍스트 안의 데이터만 사용해 답하고, 당신이 사전에 학습한 실제 서울 ' +
     '부동산 시장 지식(뉴스로 알려진 매각 사례, 유명 빌딩 거래가 등)은 이 답변에 절대 끌어오지 ' +
@@ -245,69 +228,31 @@ async function callOpenAI(sys, question, isSummary) {
 async function callGemini(sys, question) {
   var key = (process.env.GEMINI_API_KEY||"").trim();
   if (!key) return { ok: false, error: 'GEMINI_API_KEY가 서버에 설정되지 않았습니다.', model: 'gemini' };
-
-  // ★ v13.7 — Gemini 심층 분석 강화
-  // 기존에는 긴 시스템 프롬프트와 질문을 하나의 user 메시지로 합쳐 보내서,
-  // Gemini가 "분석 규칙"보다 질문의 표면적 요약에 치우치는 경우가 있었습니다.
-  // 이제 Google이 권장하는 system_instruction을 별도로 사용하고,
-  // Gemini 3.6 Flash의 thinkingLevel=high로 데이터 검산/비교를 강화합니다.
-  var geminiSystem = sys + '\n\n' +
-    '■ Gemini 전용 심층분석 규칙\n' +
-    '- 반드시 한국어로 답하세요. 영문 소제목이나 영어 결론으로 시작하지 마세요.\n' +
-    '- 단순 요약이 아니라 "왜 그런 결론인지"를 데이터로 설명하세요.\n' +
-    '- 거래사례/매물 분석 질문이면 가능한 범위에서 분석대상의 거래금액, 연면적, 대지면적, 연면적 평단가, 대지 평단가, 공시지가 대비율, 준공연도 중 최소 4개 이상의 실제 수치를 직접 인용하세요.\n' +
-    '- 비교 가능한 사례가 컨텍스트에 있으면 최소 2건을 골라 동일 지표로 비교하세요. 단, 비교대상은 질문과 규모·용도·입지가 가까운 순서로 선택하고 왜 비교했는지 한 줄로 설명하세요.\n' +
-    '- 프리미엄/디스카운트 질문이면 ① 수치상 위치 ② 가격을 높이는 요인 ③ 가격을 낮추는 요인 ④ 추가 확인사항 ⑤ 최종 판단 순서로 답하세요.\n' +
-    '- SGIS 직장인구 질문이면 ① 종사자수 ② 서울 순위/상위비율 ③ 서울 평균 대비 배수 ④ 업무집적도 해석 ⑤ 상업·오피스 입지 시사점 ⑥ 데이터 한계를 순서대로 답하세요.\n' +
-    '- 수치가 컨텍스트에 없으면 추정하지 말고 "제공 데이터 없음"이라고 명시하세요.\n' +
-    '- 결론은 반드시 마지막에 "최종 판단:"으로 한 문단 정리하세요.\n' +
-    '- 답변은 충분히 구체적으로 작성하되, 같은 말을 반복하지 마세요.';
-
   try {
+    // 무료 티어에서 신규 사용자에게 열려 있는 최신 Flash 모델로 지정합니다.
+    // (2.5-flash는 신규 사용자 제한 → 구글 안내에 따라 3.6-flash 사용)
     var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=' + key;
+    // gemini-3.6-flash는 기본적으로 "내부 추론(thinking)"에 답변 토큰 예산을
+    // 먼저 소모합니다. thinkingConfig(thinkingBudget:0) 옵션이 이 모델에서
+    // "invalid argument"로 거부되어 아예 실패했던 적이 있어, 옵션은 빼고
+    // 상한만 넉넉히(2000) 올려 추론 후에도 답변 쓸 공간을 확보합니다.
     var r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: geminiSystem }] },
-        contents: [{ role: 'user', parts: [{ text: question }] }],
-        generationConfig: {
-          maxOutputTokens: 4096,
-          thinkingConfig: { thinkingLevel: 'high' }
-        }
+        contents: [{ role: 'user', parts: [{ text: sys + '\n\n질문: ' + question }] }],
+        generationConfig: { maxOutputTokens: 2000 }
       })
     });
     var j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
     var cand = (j.candidates && j.candidates[0]) || {};
     var parts = (cand.content && cand.content.parts) || [];
-    var text = parts.map(function (p) { return p.text || ''; }).join('').trim();
+    var text = parts.map(function (p) { return p.text || ''; }).join('');
     if (!text) text = '(응답 없음' + (cand.finishReason ? ' · 종료사유: ' + cand.finishReason : '') + ')';
-    return { ok: true, text: text, model: 'gemini-3.6-flash · high reasoning' };
+    return { ok: true, text: text, model: 'gemini-3.6-flash' };
   } catch (e) {
-    // 무료 계정의 일시적 429/모델 제한 등에 대비한 안정성 fallback.
-    // 분석 품질 우선 모델은 3.6 Flash이며, 실패한 경우에만 2.5 Flash를 사용합니다.
-    try {
-      var url2 = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + key;
-      var r2 = await fetch(url2, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: geminiSystem }] },
-          contents: [{ role: 'user', parts: [{ text: question }] }],
-          generationConfig: { maxOutputTokens: 4096 }
-        })
-      });
-      var j2 = await r2.json();
-      if (!r2.ok) throw new Error((j2.error && j2.error.message) || ('HTTP ' + r2.status));
-      var cand2 = (j2.candidates && j2.candidates[0]) || {};
-      var parts2 = (cand2.content && cand2.content.parts) || [];
-      var text2 = parts2.map(function (p) { return p.text || ''; }).join('').trim();
-      if (!text2) text2 = '(응답 없음' + (cand2.finishReason ? ' · 종료사유: ' + cand2.finishReason : '') + ')';
-      return { ok: true, text: text2, model: 'gemini-2.5-flash · fallback' };
-    } catch (e2) {
-      return { ok: false, error: 'Gemini 3.6/2.5 호출 실패: ' + e2.message, model: 'gemini' };
-    }
+    return { ok: false, error: e.message, model: 'gemini' };
   }
 }
 
